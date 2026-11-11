@@ -1,0 +1,25 @@
+build/
+build-xr/
+thirdparty/
+logs/
+derive/
+gtav/generated/
+gtav/assets/
+gtav/out/
+*.log
+transfer/
+build-dll/
+build-launcher/
+dist/
+__pycache__/
+# Portable Linux release build trees (tools/release/compat/build.sh)
+build-dll-compat/
+build-launcher-compat/
+# Game script dumps and local tool binaries (game-derived: never commit)
+tools/scripttools/*.dis
+tools/scripttools/*.code
+tools/scripttools/dl/
+tools/scripttools/bk
+tools/scripttools/scan
+rexglue-sdk/
+.DS_Store
