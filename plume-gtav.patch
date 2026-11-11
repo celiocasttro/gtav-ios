@@ -1,0 +1,1082 @@
+diff --git a/plume_apple.mm b/plume_apple.mm
+index 1384fe9..3ff79fe 100644
+--- a/plume_apple.mm
++++ b/plume_apple.mm
+@@ -7,6 +7,79 @@
+ 
+ #include "plume_apple.h"
+ 
++#include <TargetConditionals.h>
++
++#if TARGET_OS_IPHONE
++// iOS: windowHandle is the UIWindow. There is no IOKit registry to read a vendor from (the GPU is
++// always Apple's) and no fullscreen toggle (apps are always fullscreen).
++#import <Foundation/Foundation.h>
++#import <UIKit/UIKit.h>
++
++namespace plume {
++    RenderDeviceVendor getRenderDeviceVendor(uint64_t registryID) {
++        (void)registryID;
++        return RenderDeviceVendor::APPLE;
++    }
++
++    static void plumeReadWindow(void* handle, CocoaWindowAttributes* out, int* refresh) {
++        UIWindow *window = (__bridge UIWindow *)handle;
++        CGRect bounds = window.bounds;
++        UIScreen *screen = window.screen ? window.screen : [UIScreen mainScreen];
++        CGFloat scale = screen.nativeScale;
++        out->x = 0;
++        out->y = 0;
++        out->width = (int)round(bounds.size.width * scale);
++        out->height = (int)round(bounds.size.height * scale);
++        *refresh = (int)screen.maximumFramesPerSecond;
++    }
++
++    CocoaWindow::CocoaWindow(void* window)
++        : windowHandle(window), cachedRefreshRate(0) {
++        cachedAttributes = {0, 0, 0, 0};
++        updateWindowAttributesInternal(true);
++    }
++
++    CocoaWindow::~CocoaWindow() {}
++
++    void CocoaWindow::updateWindowAttributesInternal(bool forceSync) {
++        auto updateBlock = ^{
++            CocoaWindowAttributes attributes;
++            int refresh = 0;
++            plumeReadWindow(windowHandle, &attributes, &refresh);
++            std::lock_guard<std::mutex> lock(attributesMutex);
++            cachedAttributes = attributes;
++            cachedRefreshRate.store(refresh);
++        };
++        if ([NSThread isMainThread]) {
++            updateBlock();
++        } else if (forceSync) {
++            dispatch_sync(dispatch_get_main_queue(), updateBlock);
++        } else {
++            dispatch_async(dispatch_get_main_queue(), updateBlock);
++        }
++    }
++
++    void CocoaWindow::updateRefreshRateInternal(bool forceSync) {
++        updateWindowAttributesInternal(forceSync);
++    }
++
++    void CocoaWindow::getWindowAttributes(CocoaWindowAttributes* attributes) const {
++        {
++            std::lock_guard<std::mutex> lock(attributesMutex);
++            *attributes = cachedAttributes;
++        }
++        const_cast<CocoaWindow*>(this)->updateWindowAttributesInternal(false);
++    }
++
++    int CocoaWindow::getRefreshRate() const {
++        return cachedRefreshRate.load();
++    }
++
++    void CocoaWindow::toggleFullscreen() {}
++}
++
++#else
++
+ #import <AppKit/AppKit.h>
+ #import <Foundation/Foundation.h>
+ #import <IOKit/IOKitLib.h>
+@@ -176,3 +249,5 @@ namespace plume {
+         }
+     }
+ }
++
++#endif  // TARGET_OS_IPHONE
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 2048557..6df11cb 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -127,6 +127,8 @@ namespace plume {
+         virtual void setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) = 0;
+         virtual void setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) = 0;
+         virtual void setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) = 0;
++        // Binds a set with CONSTANT_BUFFER_DYNAMIC ranges, one offset per dynamic descriptor (Vulkan only).
++        virtual void setGraphicsDescriptorSetDynamic(RenderDescriptorSet *descriptorSet, uint32_t setIndex, const uint32_t *dynamicOffsets, uint32_t dynamicOffsetCount) {}
+         virtual void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) = 0;
+         virtual void setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) = 0;
+         virtual void setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) = 0;
+@@ -150,6 +152,13 @@ namespace plume {
+         virtual void discardTexture(const RenderTexture* texture) = 0; // D3D12 only.
+         virtual void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) = 0;
+         virtual void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) = 0;
++        // Occlusion queries (Vulkan only; no-ops elsewhere). The begin and end are recorded outside any
++        // render pass, so a query may span several of them.
++        virtual void beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) { }
++        virtual void endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) { }
++        // Per-draw fragment shading rate (1x1, 2x1, 1x2, 2x2), Vulkan with VK_KHR_fragment_shading_rate
++        // only; setFramebuffer resets it to 1x1.
++        virtual void setFragmentShadingRate(uint32_t width, uint32_t height) { }
+ 
+         // Concrete implementation shortcuts.
+         inline void barriers(RenderBarrierStages stages, const RenderBufferBarrier &barrier) {
+@@ -241,6 +250,8 @@ namespace plume {
+         virtual std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() = 0;
+         virtual std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) = 0;
+         virtual std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) = 0;
++        // Precise sample-count queries; nullptr when the backend has none (see beginOcclusionQuery).
++        virtual std::unique_ptr<RenderQueryPool> createOcclusionQueryPool(uint32_t queryCount) { return nullptr; }
+         virtual void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild = true, bool preferFastTrace = false) = 0;
+         virtual void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild = true, bool preferFastTrace = false) = 0;
+         virtual void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) = 0;
+diff --git a/plume_render_interface_builders.h b/plume_render_interface_builders.h
+index acfedce..d49581a 100644
+--- a/plume_render_interface_builders.h
++++ b/plume_render_interface_builders.h
+@@ -35,6 +35,10 @@ namespace plume {
+             return addRange(RenderDescriptorRange(RenderDescriptorRangeType::CONSTANT_BUFFER, binding, count, nullptr));
+         }
+ 
++        uint32_t addConstantBufferDynamic(uint32_t binding, uint32_t count = 1) {
++            return addRange(RenderDescriptorRange(RenderDescriptorRangeType::CONSTANT_BUFFER_DYNAMIC, binding, count, nullptr));
++        }
++
+         uint32_t addFormattedBuffer(uint32_t binding, uint32_t count = 1) {
+             return addRange(RenderDescriptorRange(RenderDescriptorRangeType::FORMATTED_BUFFER, binding, count, nullptr));
+         }
+@@ -51,6 +55,10 @@ namespace plume {
+             return addRange(RenderDescriptorRange(RenderDescriptorRangeType::READ_WRITE_TEXTURE, binding, count, nullptr));
+         }
+ 
++        uint32_t addInputAttachment(uint32_t binding, uint32_t count = 1) {
++            return addRange(RenderDescriptorRange(RenderDescriptorRangeType::INPUT_ATTACHMENT, binding, count, nullptr));
++        }
++
+         uint32_t addSampler(uint32_t binding, uint32_t count = 1) {
+             return addRange(RenderDescriptorRange(RenderDescriptorRangeType::SAMPLER, binding, count, nullptr));
+         }
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+index ad63e0e..2ad1ad4 100644
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -166,6 +166,7 @@ namespace plume {
+         BC7_TYPELESS,
+         BC7_UNORM,
+         BC7_UNORM_SRGB,
++        B5G6R5_UNORM,  // 16-bit colour (iOS: opaque DXT1 decoded on the CPU)
+         MAX
+     };
+ 
+@@ -351,7 +352,9 @@ namespace plume {
+         READ_WRITE_STRUCTURED_BUFFER,
+         BYTE_ADDRESS_BUFFER,
+         READ_WRITE_BYTE_ADDRESS_BUFFER,
+-        ACCELERATION_STRUCTURE
++        ACCELERATION_STRUCTURE,
++        INPUT_ATTACHMENT,  // Vulkan only: the colour attachment at the same index (g_colorInputAttachments)
++        CONSTANT_BUFFER_DYNAMIC  // Vulkan only: uniform buffer whose offset is given when the set is bound
+     };
+ 
+     enum class RenderRootDescriptorType {
+@@ -453,6 +456,9 @@ namespace plume {
+             GRAPHICS = 1U << 0,
+             COMPUTE = 1U << 1,
+             COPY = 1U << 2,
++            // Render target use only (attachment loads, writes and tests): fragment stages, so a
++            // following pass's vertex work does not wait for it (Vulkan backend; MoltenVK fences).
++            FRAGMENT = 1U << 3,
+             GRAPHICS_AND_COMPUTE = GRAPHICS | COMPUTE,
+             ALL = GRAPHICS | COMPUTE | COPY
+         };
+@@ -565,6 +571,7 @@ namespace plume {
+         case RenderFormat::R8G8_SINT:
+         case RenderFormat::R16_TYPELESS:
+         case RenderFormat::R16_FLOAT:
++        case RenderFormat::B5G6R5_UNORM:
+         case RenderFormat::D16_UNORM:
+         case RenderFormat::R16_UNORM:
+         case RenderFormat::R16_UINT:
+@@ -648,6 +655,7 @@ namespace plume {
+         case RenderFormat::R8G8_SINT:
+         case RenderFormat::R16_TYPELESS:
+         case RenderFormat::R16_FLOAT:
++        case RenderFormat::B5G6R5_UNORM:
+         case RenderFormat::D16_UNORM:
+         case RenderFormat::R16_UNORM:
+         case RenderFormat::R16_UINT:
+@@ -1627,6 +1635,8 @@ namespace plume {
+         const RenderTexture *depthAttachment = nullptr;
+         const RenderTextureView *depthAttachmentView = nullptr;
+         bool depthAttachmentReadOnly = false;
++        // Colour attachments start undefined (LOAD_OP_DONT_CARE): for passes that overwrite them whole.
++        bool colorDiscard = false;
+ 
+         RenderFramebufferDesc() = default;
+ 
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 4fdc4bf..fe25401 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -11,7 +11,16 @@
+ #include "plume_vulkan.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
++#if defined(__APPLE__)
++#   include <TargetConditionals.h>
++#   if TARGET_OS_IPHONE
++#       include <dlfcn.h>
++#       include <mach-o/dyld.h>
++#       include <string>
++#   endif
++#endif
+ #include <climits>
+ #include <unordered_map>
+ 
+@@ -28,6 +37,25 @@
+ // - Fix resource pools.
+ 
+ namespace plume {
++    // Counters for the host renderer's per-frame stats: render passes begun, barrier calls.
++    uint32_t g_statRenderPasses = 0, g_statBarriers = 0;
++    bool g_exactBarrierStages = true;  // strip TOP_OF_PIPE / BOTTOM_OF_PIPE next to other stages (see barriers)
++    // Every render pass also declares its colour attachments as input attachments (same indices,
++    // GENERAL layout) and render targets get the input attachment usage, so a pipeline can read the
++    // attachment under the fragment (framebuffer fetch on MoltenVK). Set before creating resources.
++    bool g_colorInputAttachments = false;
++    // A clear of a whole attachment before anything else in a render pass becomes the pass's load op
++    // (LOAD_OP_CLEAR) instead of a LOAD followed by vkCmdClearAttachments: tilers (Adreno, Mali) skip
++    // reading the old contents into tile memory. g_statLoadClears counts the attachments so cleared.
++    bool g_clearLoadOps = false;
++    uint32_t g_statLoadClears = 0;
++    uint32_t g_statClearsInPass = 0, g_statClearsPartial = 0;  // clears that could not become load ops, and why
++
++    static std::vector<uint8_t> &pipelineCacheSeed() {
++        static std::vector<uint8_t> seed;
++        return seed;
++    }
++
+     // Backend constants.
+ 
+     // Required buffer alignment for acceleration structures.
+@@ -87,6 +115,8 @@ namespace plume {
+         VK_KHR_PRESENT_ID_EXTENSION_NAME,
+         VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
+         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
++        VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME,
++        VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,  // required by fragment shading rate on Vulkan 1.1
+         // Vulkan spec requires this to be enabled if supported by the driver.
+         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+     };
+@@ -175,6 +205,8 @@ namespace plume {
+             return VK_FORMAT_R32_SINT;
+         case RenderFormat::R8G8_TYPELESS:
+             return VK_FORMAT_R8G8_UNORM;
++        case RenderFormat::B5G6R5_UNORM:
++            return VK_FORMAT_B5G6R5_UNORM_PACK16;
+         case RenderFormat::R8G8_UNORM:
+             return VK_FORMAT_R8G8_UNORM;
+         case RenderFormat::R8G8_UINT:
+@@ -527,6 +559,10 @@ namespace plume {
+             return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+         case RenderDescriptorRangeType::ACCELERATION_STRUCTURE:
+             return VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
++        case RenderDescriptorRangeType::INPUT_ATTACHMENT:
++            return VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
++        case RenderDescriptorRangeType::CONSTANT_BUFFER_DYNAMIC:
++            return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+         default:
+             assert(false && "Unknown descriptor range type.");
+             return VK_DESCRIPTOR_TYPE_MAX_ENUM;
+@@ -619,6 +655,13 @@ namespace plume {
+             }
+         }
+ 
++        if (stages & RenderBarrierStage::FRAGMENT) {
++            flags |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++            flags |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
++            flags |= VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
++            flags |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
++        }
++
+         if (stages & RenderBarrierStage::COMPUTE) {
+             flags |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+ 
+@@ -835,7 +878,7 @@ namespace plume {
+         bufferInfo.usage |= (desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT) ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR : 0;
+         bufferInfo.usage |= (desc.flags & RenderBufferFlag::SHADER_BINDING_TABLE) ? VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR : 0;
+         
+-        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
++        const uint32_t deviceAddressMask = RenderBufferFlag::CONSTANT | RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::ACCELERATION_STRUCTURE | RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH | RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT | RenderBufferFlag::SHADER_BINDING_TABLE;
+         const bool useDeviceAddress = device->capabilities.bufferDeviceAddress && (desc.flags & deviceAddressMask);
+         bufferInfo.usage |= useDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0;
+         
+@@ -930,7 +973,15 @@ namespace plume {
+         info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+         info.pNext = nullptr;
+         info.buffer = vk;
+-        return vkGetBufferDeviceAddress(device->vk, &info);
++        // KHR first: on Adreno (Android) the loader hands out a core 1.2 trampoline whose driver
++        // entry is null, so calling vkGetBufferDeviceAddress jumps to address 0.
++        if (vkGetBufferDeviceAddressKHR != nullptr) {
++            return vkGetBufferDeviceAddressKHR(device->vk, &info);
++        }
++        if (vkGetBufferDeviceAddress != nullptr) {
++            return vkGetBufferDeviceAddress(device->vk, &info);
++        }
++        return 0;
+     }
+ 
+     // VulkanBufferFormattedView
+@@ -986,6 +1037,7 @@ namespace plume {
+         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+         imageInfo.usage |= (desc.flags & RenderTextureFlag::RENDER_TARGET) ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0;
++        imageInfo.usage |= ((desc.flags & RenderTextureFlag::RENDER_TARGET) && g_colorInputAttachments) ? VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT : 0;
+         imageInfo.usage |= (desc.flags & RenderTextureFlag::DEPTH_TARGET) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0;
+         imageInfo.usage |= (desc.flags & RenderTextureFlag::STORAGE) ? VK_IMAGE_USAGE_STORAGE_BIT : 0;
+ 
+@@ -1007,6 +1059,13 @@ namespace plume {
+         if (desc.committed) {
+             createInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+         }
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++        // MoltenVK gives every image its own MTLTexture whatever memory it is bound to, and turns a
++        // memory block into one MTLBuffer of the whole block once any buffer is bound in it: images
++        // sharing VMA blocks with buffers were paid twice (iPhone: ~750 MB of Metal memory beyond
++        // the caches, then the app was killed). An image's own allocation costs nothing extra.
++        createInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
++#endif
+ 
+         VkResult res = vmaCreateImage(device->allocator, &imageInfo, &createInfo, &vk, &allocation, &allocationInfo);
+         if (res != VK_SUCCESS) {
+@@ -1094,6 +1153,12 @@ namespace plume {
+         viewInfo.components.b = toVk(desc.componentMapping.b);
+         viewInfo.components.a = toVk(desc.componentMapping.a);
+         viewInfo.subresourceRange.aspectMask = toViewAspectFlags(texture->desc.flags);
++        // gtav: an R8_UINT view of a depth-stencil texture selects its stencil aspect.
++        if ((texture->desc.flags & RenderTextureFlag::DEPTH_TARGET) && desc.format == RenderFormat::R8_UINT &&
++            RenderFormatIsStencil(texture->desc.format)) {
++            viewInfo.format = toVk(texture->desc.format);
++            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
++        }
+         viewInfo.subresourceRange.baseMipLevel = desc.mipSlice;
+         viewInfo.subresourceRange.levelCount = mipLevels;
+         viewInfo.subresourceRange.baseArrayLayer = desc.arrayIndex;
+@@ -1390,7 +1455,7 @@ namespace plume {
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.stage = stageInfo;
+ 
+-        VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
++        VkResult res = vkCreateComputePipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
+             return;
+@@ -1617,6 +1682,10 @@ namespace plume {
+             dynamicStates.emplace_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+         }
+ 
++        if (device->fragmentShadingRateSupported) {
++            dynamicStates.emplace_back(VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR);
++        }
++
+         VkPipelineDynamicStateCreateInfo dynamicState = {};
+         dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+         dynamicState.pDynamicStates = dynamicStates.data();
+@@ -1649,7 +1718,7 @@ namespace plume {
+         pipelineInfo.layout = pipelineLayout->vk;
+         pipelineInfo.renderPass = renderPass;
+ 
+-        VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
++        VkResult res = vkCreateGraphicsPipelines(device->vk, device->pipelineCache, 1, &pipelineInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
+             return;
+@@ -1705,6 +1774,16 @@ namespace plume {
+ 
+         subpass.pColorAttachments = !colorReferences.empty() ? colorReferences.data() : nullptr;
+         subpass.colorAttachmentCount = uint32_t(colorReferences.size());
++        thread_local std::vector<VkAttachmentReference> inputReferences;
++        inputReferences.clear();
++        if (g_colorInputAttachments) {
++            for (VkAttachmentReference reference : colorReferences) {
++                reference.layout = VK_IMAGE_LAYOUT_GENERAL;
++                inputReferences.emplace_back(reference);
++            }
++            subpass.pInputAttachments = !inputReferences.empty() ? inputReferences.data() : nullptr;
++            subpass.inputAttachmentCount = uint32_t(inputReferences.size());
++        }
+ 
+         if (depthTargetFormat != VK_FORMAT_UNDEFINED) {
+             depthReference.attachment = uint32_t(attachments.size());
+@@ -2352,11 +2431,17 @@ namespace plume {
+         createInfo.clipped = VK_TRUE;
+         createInfo.oldSwapchain = vk;
+ 
+-        VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
++        VkSwapchainKHR created = VK_NULL_HANDLE;
++        VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &created);
+         if (res != VK_SUCCESS) {
++            // The old swap chain is retired either way (VK_ERROR_SURFACE_LOST_KHR when Android
++            // destroyed the window's surface): release it, isEmpty() is true until a resize works.
+             fprintf(stderr, "vkCreateSwapchainKHR failed with error code 0x%X.\n", res);
++            textures.clear();
++            releaseSwapChain();
+             return false;
+         }
++        vk = created;
+ 
+         // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
+         createdPresentMode = requiredPresentMode;
+@@ -2548,8 +2633,11 @@ namespace plume {
+             imageViews.emplace_back(colorAttachmentImageView);
+ 
+             if (i == 0) {
+-                width = uint32_t(colorAttachment->desc.width);
+-                height = colorAttachment->desc.height;
++                // A view of a mip level renders at that level's size.
++                uint32_t mip = (desc.colorAttachmentViews && desc.colorAttachmentViews[i])
++                    ? static_cast<const VulkanTextureView *>(desc.colorAttachmentViews[i])->desc.mipSlice : 0;
++                width = std::max(uint32_t(colorAttachment->desc.width) >> mip, 1U);
++                height = std::max(colorAttachment->desc.height >> mip, 1U);
+             }
+ 
+             VkAttachmentReference reference = {};
+@@ -2560,7 +2648,7 @@ namespace plume {
+             VkAttachmentDescription attachment = {};
+             attachment.format = toVk(colorAttachmentFormat);
+             attachment.samples = VkSampleCountFlagBits(colorAttachment->desc.multisampling.sampleCount);
+-            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++            attachment.loadOp = desc.colorDiscard ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD;
+             attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+             attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+             attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+@@ -2619,6 +2707,16 @@ namespace plume {
+         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+         subpass.pColorAttachments = !colorReferences.empty() ? colorReferences.data() : nullptr;
+         subpass.colorAttachmentCount = uint32_t(colorReferences.size());
++        thread_local std::vector<VkAttachmentReference> inputReferences;
++        inputReferences.clear();
++        if (g_colorInputAttachments) {
++            for (VkAttachmentReference reference : colorReferences) {
++                reference.layout = VK_IMAGE_LAYOUT_GENERAL;
++                inputReferences.emplace_back(reference);
++            }
++            subpass.pInputAttachments = !inputReferences.empty() ? inputReferences.data() : nullptr;
++            subpass.inputAttachmentCount = uint32_t(inputReferences.size());
++        }
+ 
+         if (desc.depthAttachment != nullptr || desc.depthAttachmentView != nullptr) {
+             subpass.pDepthStencilAttachment = &depthReference;
+@@ -2636,6 +2734,11 @@ namespace plume {
+             fprintf(stderr, "vkCreateRenderPass failed with error code 0x%X.\n", res);
+             return;
+         }
++        attachmentDescs = attachments;
++        clearColorReferences = colorReferences;
++        clearInputReferences = inputReferences;
++        clearDepthReference = depthReference;
++        hasDepthAttachment = subpass.pDepthStencilAttachment != nullptr;
+         
+         VkFramebufferCreateInfo fbInfo = {};
+         fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+@@ -2658,11 +2761,65 @@ namespace plume {
+             vkDestroyFramebuffer(device->vk, vk, nullptr);
+         }
+ 
++        for (auto &[mask, pass] : clearPasses) {
++            vkDestroyRenderPass(device->vk, pass, nullptr);
++        }
++
+         if (renderPass != VK_NULL_HANDLE) {
+             vkDestroyRenderPass(device->vk, renderPass, nullptr);
+         }
+     }
+ 
++    // The render pass with LOAD_OP_CLEAR for the attachments in `mask` (bit i: colour i, bit 8: depth,
++    // bit 9: stencil). Load ops do not change render pass compatibility, so it runs on this framebuffer.
++    VkRenderPass VulkanFramebuffer::clearPass(uint32_t mask) const {
++        std::lock_guard<std::mutex> lock(clearPassesMutex);
++        VkRenderPass &pass = clearPasses[mask];
++        if (pass != VK_NULL_HANDLE) {
++            return pass;
++        }
++
++        std::vector<VkAttachmentDescription> attachments = attachmentDescs;
++        const uint32_t colorCount = uint32_t(clearColorReferences.size());
++        for (uint32_t i = 0; i < colorCount; i++) {
++            if (mask & (1u << i)) {
++                attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            }
++        }
++        if (hasDepthAttachment) {
++            VkAttachmentDescription &depth = attachments[colorCount];
++            if (mask & (1u << 8)) {
++                depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            }
++            if (mask & (1u << 9)) {
++                depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
++            }
++        }
++
++        VkSubpassDescription subpass = {};
++        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
++        subpass.pColorAttachments = !clearColorReferences.empty() ? clearColorReferences.data() : nullptr;
++        subpass.colorAttachmentCount = colorCount;
++        subpass.pInputAttachments = !clearInputReferences.empty() ? clearInputReferences.data() : nullptr;
++        subpass.inputAttachmentCount = uint32_t(clearInputReferences.size());
++        subpass.pDepthStencilAttachment = hasDepthAttachment ? &clearDepthReference : nullptr;
++
++        VkRenderPassCreateInfo passInfo = {};
++        passInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
++        passInfo.pAttachments = attachments.data();
++        passInfo.attachmentCount = uint32_t(attachments.size());
++        passInfo.pSubpasses = &subpass;
++        passInfo.subpassCount = 1;
++        VkResult res = vkCreateRenderPass(device->vk, &passInfo, nullptr, &pass);
++        if (res != VK_SUCCESS) {
++            fprintf(stderr, "vkCreateRenderPass failed with error code 0x%X.\n", res);
++            pass = VK_NULL_HANDLE;
++            return renderPass;
++        }
++
++        return pass;
++    }
++
+     uint32_t VulkanFramebuffer::getWidth() const {
+         return width;
+     }
+@@ -2685,15 +2842,16 @@ namespace plume {
+ 
+     // VulkanQueryPool
+ 
+-    VulkanQueryPool::VulkanQueryPool(VulkanDevice *device, uint32_t queryCount) {
++    VulkanQueryPool::VulkanQueryPool(VulkanDevice *device, uint32_t queryCount, bool occlusion) {
+         assert(device != nullptr);
+         assert(queryCount > 0);
+ 
+         this->device = device;
++        this->occlusion = occlusion;
+ 
+         VkQueryPoolCreateInfo createInfo = {};
+         createInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+-        createInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
++        createInfo.queryType = occlusion ? VK_QUERY_TYPE_OCCLUSION : VK_QUERY_TYPE_TIMESTAMP;
+         createInfo.queryCount = queryCount;
+         
+         VkResult res = vkCreateQueryPool(device->vk, &createInfo, nullptr, &vk);
+@@ -2711,11 +2869,17 @@ namespace plume {
+ 
+     void VulkanQueryPool::queryResults() {
+ 	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+-        if (res != VK_SUCCESS) {
++        // Occlusion pools are read whole; queries a frame did not use stay unavailable.
++        if (res != VK_SUCCESS && !(occlusion && res == VK_NOT_READY)) {
+             fprintf(stderr, "vkGetQueryPoolResults failed with error code 0x%X.\n", res);
+             return;
+         }
+ 
++        // Sample counts need no conversion.
++        if (occlusion) {
++            return;
++        }
++
+         // Conversion sourced from Godot Engine's Vulkan Rendering Driver.
+         auto mult64to128 = [](uint64_t u, uint64_t v, uint64_t &h, uint64_t &l) {
+             uint64_t u1 = (u & 0xffffffff);
+@@ -2800,6 +2964,8 @@ namespace plume {
+ 
+     void VulkanCommandList::begin() {
+         vkResetCommandBuffer(vk, 0);
++        pendingClearMask = 0;
++        shadingRate = 0;
+ 
+         VkCommandBufferBeginInfo beginInfo = {};
+         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+@@ -2810,6 +2976,11 @@ namespace plume {
+             fprintf(stderr, "vkBeginCommandBuffer failed with error code 0x%X.\n", res);
+             return;
+         }
++
++        if (queue->device->fragmentShadingRateSupported) {
++            // A dynamic state: it has to be set before the first draw of the command buffer.
++            setFragmentShadingRate(1, 1);
++        }
+     }
+ 
+     void VulkanCommandList::end() {
+@@ -2888,7 +3059,18 @@ namespace plume {
+             return;
+         }
+ 
++        // TOP_OF_PIPE as a source and BOTTOM_OF_PIPE as a destination add nothing next to other
++        // stages, but MoltenVK maps both to every Metal stage (vertex, fragment, compute, copy fences):
++        // each barrier then made the next pass wait for all earlier work before its vertex stage.
++        if (g_exactBarrierStages && srcStageMask != VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT) {
++            srcStageMask &= ~VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
++        }
++        if (g_exactBarrierStages && dstStageMask != VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT) {
++            dstStageMask &= ~VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
++        }
++
+         vkCmdPipelineBarrier(vk, srcStageMask, dstStageMask, 0, 0, nullptr, uint32_t(bufferMemoryBarriers.size()), bufferMemoryBarriers.data(), uint32_t(imageMemoryBarriers.size()), imageMemoryBarriers.data());
++        g_statBarriers++;
+     }
+ 
+     void VulkanCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
+@@ -3007,6 +3189,13 @@ namespace plume {
+         setDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, activeGraphicsPipelineLayout, descriptorSet, setIndex);
+     }
+ 
++    void VulkanCommandList::setGraphicsDescriptorSetDynamic(RenderDescriptorSet *descriptorSet, uint32_t setIndex, const uint32_t *dynamicOffsets, uint32_t dynamicOffsetCount) {
++        assert(activeGraphicsPipelineLayout != nullptr);
++        assert(descriptorSet != nullptr);
++        const VulkanDescriptorSet *interfaceSet = static_cast<const VulkanDescriptorSet *>(descriptorSet);
++        vkCmdBindDescriptorSets(vk, VK_PIPELINE_BIND_POINT_GRAPHICS, activeGraphicsPipelineLayout->vk, setIndex, 1, &interfaceSet->vk, dynamicOffsetCount, dynamicOffsets);
++    }
++
+     void VulkanCommandList::setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) {
+         assert(false && "Root descriptors are not supported in Vulkan.");
+     }
+@@ -3104,6 +3293,7 @@ namespace plume {
+ 
+     void VulkanCommandList::setFramebuffer(const RenderFramebuffer *framebuffer) {
+         endActiveRenderPass();
++        setFragmentShadingRate(1, 1);  // per pass: the caller coarsens it after binding (SetFragmentShadingRate)
+ 
+         if (framebuffer != nullptr) {
+             const VulkanFramebuffer *interfaceFramebuffer = static_cast<const VulkanFramebuffer *>(framebuffer);
+@@ -3150,6 +3340,16 @@ namespace plume {
+         assert(attachmentIndex < targetFramebuffer->colorAttachments.size());
+         assert((clearRectsCount == 0) || (clearRects != nullptr));
+ 
++        if (deferClear(clearRects, clearRectsCount)) {
++            pendingClearMask |= 1u << attachmentIndex;
++            auto &value = pendingClearValues[attachmentIndex].color.float32;
++            value[0] = colorValue.r;
++            value[1] = colorValue.g;
++            value[2] = colorValue.b;
++            value[3] = colorValue.a;
++            return;
++        }
++
+         checkActiveRenderPass();
+ 
+         thread_local std::vector<VkClearRect> rectVector;
+@@ -3170,6 +3370,19 @@ namespace plume {
+         assert(targetFramebuffer != nullptr);
+         assert((clearRectsCount == 0) || (clearRects != nullptr));
+ 
++        if ((clearDepth || clearStencil) && !targetFramebuffer->depthAttachmentReadOnly && deferClear(clearRects, clearRectsCount)) {
++            VkClearDepthStencilValue &value = pendingClearValues[8].depthStencil;
++            if (clearDepth) {
++                pendingClearMask |= 1u << 8;
++                value.depth = depthValue;
++            }
++            if (clearStencil) {
++                pendingClearMask |= 1u << 9;
++                value.stencil = stencilValue;
++            }
++            return;
++        }
++
+         checkActiveRenderPass();
+ 
+         thread_local std::vector<VkClearRect> rectVector;
+@@ -3486,6 +3699,8 @@ namespace plume {
+     void VulkanCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
+         assert(queryPool != nullptr);
+ 
++        // Not allowed inside a render pass.
++        endActiveRenderPass();
+         const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
+         vkCmdResetQueryPool(vk, interfaceQueryPool->vk, queryFirstIndex, queryCount);
+     }
+@@ -3497,6 +3712,22 @@ namespace plume {
+         vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
+     }
+ 
++    void VulkanCommandList::beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
++        assert(queryPool != nullptr);
++
++        endActiveRenderPass();
++        const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
++        vkCmdBeginQuery(vk, interfaceQueryPool->vk, queryIndex, interfaceQueryPool->device->occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
++    }
++
++    void VulkanCommandList::endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
++        assert(queryPool != nullptr);
++
++        endActiveRenderPass();
++        const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
++        vkCmdEndQuery(vk, interfaceQueryPool->vk, queryIndex);
++    }
++
+     void VulkanCommandList::checkActiveRenderPass() {
+         assert(targetFramebuffer != nullptr);
+         
+@@ -3507,12 +3738,68 @@ namespace plume {
+             beginInfo.framebuffer = targetFramebuffer->vk;
+             beginInfo.renderArea.extent.width = targetFramebuffer->width;
+             beginInfo.renderArea.extent.height = targetFramebuffer->height;
++            VkClearValue clearValues[9];
++            if (pendingClearMask != 0) {
++                // Attachment order: the colour attachments, then depth (see the framebuffer).
++                const uint32_t colorCount = uint32_t(targetFramebuffer->colorAttachments.size());
++                for (uint32_t i = 0; i < colorCount; i++) {
++                    clearValues[i] = pendingClearValues[i];
++                    g_statLoadClears += (pendingClearMask >> i) & 1;
++                }
++                clearValues[colorCount] = pendingClearValues[8];
++                g_statLoadClears += (pendingClearMask >> 8) & 1;
++                beginInfo.renderPass = targetFramebuffer->clearPass(pendingClearMask);
++                beginInfo.clearValueCount = colorCount + (targetFramebuffer->hasDepthAttachment ? 1 : 0);
++                beginInfo.pClearValues = clearValues;
++                pendingClearMask = 0;
++            }
+             vkCmdBeginRenderPass(vk, &beginInfo, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
+-            activeRenderPass = targetFramebuffer->renderPass;
++            activeRenderPass = beginInfo.renderPass;
++            g_statRenderPasses++;
+         }
+     }
+ 
++    void VulkanCommandList::setFragmentShadingRate(uint32_t width, uint32_t height) {
++        const uint32_t rate = (width << 4) | height;
++        if (!queue->device->fragmentShadingRateSupported || rate == shadingRate) {
++            return;
++        }
++        shadingRate = rate;
++        const VkExtent2D size = { width, height };
++        const VkFragmentShadingRateCombinerOpKHR ops[2] = { VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR, VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR };
++        vkCmdSetFragmentShadingRateKHR(vk, &size, ops);
++    }
++
++    // A whole-attachment clear before the render pass has begun: kept for its load op (g_clearLoadOps).
++    bool VulkanCommandList::deferClear(const RenderRect *clearRects, uint32_t clearRectsCount) {
++        if (!g_clearLoadOps || targetFramebuffer == nullptr) {
++            return false;
++        }
++        if (activeRenderPass != VK_NULL_HANDLE) {
++            g_statClearsInPass++;
++            return false;
++        }
++        if (clearRectsCount > 1) {
++            g_statClearsPartial++;
++            return false;
++        }
++        if (clearRectsCount == 1) {
++            const RenderRect &r = clearRects[0];
++            if (r.left <= 0 && r.top <= 0 && r.right >= int32_t(targetFramebuffer->width) && r.bottom >= int32_t(targetFramebuffer->height)) {
++                return true;
++            }
++            g_statClearsPartial++;
++            return false;
++        }
++        return true;
++    }
++
+     void VulkanCommandList::endActiveRenderPass() {
++        if (activeRenderPass == VK_NULL_HANDLE && pendingClearMask != 0 && targetFramebuffer != nullptr) {
++            // Clears with no draw after them still happen: an empty pass that only clears.
++            checkActiveRenderPass();
++        }
++        pendingClearMask = 0;
+         if (activeRenderPass != VK_NULL_HANDLE) {
+             vkCmdEndRenderPass(vk);
+             activeRenderPass = VK_NULL_HANDLE;
+@@ -3666,7 +3953,22 @@ namespace plume {
+         assert(fence != nullptr);
+ 
+         VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
+-        VkResult res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, UINT64_MAX);
++        // Wait in finite slices: Adreno's driver returns VK_TIMEOUT for an infinite (UINT64_MAX)
++        // wait while the GPU is still busy, and treating that as done let callers reuse command
++        // buffers and fences the GPU was still executing (GPU faults a few frames in).
++        VkResult res;
++        const auto waitStart = std::chrono::steady_clock::now();
++        int reportedSeconds = 0;
++        do {
++            res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, 250000000ull);
++            if (res == VK_TIMEOUT) {
++                const int seconds = int(std::chrono::duration<double>(std::chrono::steady_clock::now() - waitStart).count());
++                if (seconds >= reportedSeconds + 5) {
++                    reportedSeconds = seconds;
++                    fprintf(stderr, "vkWaitForFences: still waiting after %d s.\n", seconds);
++                }
++            }
++        } while (res == VK_TIMEOUT);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
+             return;
+@@ -3914,6 +4216,14 @@ namespace plume {
+             featuresChain = &portabilityFeatures;
+         }
+ 
++        VkPhysicalDeviceFragmentShadingRateFeaturesKHR shadingRateFeatures = {};
++        const bool shadingRateFound = supportedOptionalExtensions.find(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME) != supportedOptionalExtensions.end() && supportedOptionalExtensions.find(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) != supportedOptionalExtensions.end();
++        if (shadingRateFound) {
++            shadingRateFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR;
++            shadingRateFeatures.pNext = featuresChain;
++            featuresChain = &shadingRateFeatures;
++        }
++
+         VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures = {};
+         VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures = {};
+         const bool rayTracingFound = (supportedOptionalExtensions.find(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) != supportedOptionalExtensions.end()) && (supportedOptionalExtensions.find(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) != supportedOptionalExtensions.end());
+@@ -3931,6 +4241,7 @@ namespace plume {
+         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+         deviceFeatures.pNext = featuresChain;
+         vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
++        occlusionQueryPrecise = deviceFeatures.features.occlusionQueryPrecise;
+ 
+         // Check for properties.
+         if (rayTracingFound) {
+@@ -4001,6 +4312,15 @@ namespace plume {
+             createDeviceChain = &portabilityFeatures;
+         }
+ 
++        // Only the per-draw (pipeline/dynamic) rate is used: coarse shading for chosen passes.
++        fragmentShadingRateSupported = shadingRateFound && shadingRateFeatures.pipelineFragmentShadingRate;
++        if (fragmentShadingRateSupported) {
++            shadingRateFeatures.primitiveFragmentShadingRate = VK_FALSE;
++            shadingRateFeatures.attachmentFragmentShadingRate = VK_FALSE;
++            shadingRateFeatures.pNext = createDeviceChain;
++            createDeviceChain = &shadingRateFeatures;
++        }
++
+         // Retrieve the information for the queue families.
+         uint32_t queueFamilyCount = 0;
+         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
+@@ -4092,6 +4412,22 @@ namespace plume {
+             }
+         }
+ 
++        {
++            std::vector<uint8_t> seed = std::move(pipelineCacheSeed());
++            VkPipelineCacheCreateInfo cacheInfo = {};
++            cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
++            cacheInfo.initialDataSize = seed.size();
++            cacheInfo.pInitialData = seed.empty() ? nullptr : seed.data();
++            if (vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
++                // Stale or foreign data: start empty.
++                cacheInfo.initialDataSize = 0;
++                cacheInfo.pInitialData = nullptr;
++                if (vkCreatePipelineCache(vk, &cacheInfo, nullptr, &pipelineCache) != VK_SUCCESS) {
++                    pipelineCache = VK_NULL_HANDLE;
++                }
++            }
++        }
++
+         VmaVulkanFunctions vmaFunctions = {};
+         vmaFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+         vmaFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+@@ -4120,6 +4456,11 @@ namespace plume {
+         allocatorInfo.pVulkanFunctions = &vmaFunctions;
+         allocatorInfo.instance = renderInterface->instance;
+         allocatorInfo.vulkanApiVersion = renderInterface->appInfo.apiVersion;
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++        // 256 MB default blocks: each becomes a 256 MB MTLBuffer under MoltenVK (the phone's Metal
++        // memory grew in 256 MB steps); smaller blocks leave less unused memory behind.
++        allocatorInfo.preferredLargeHeapBlockSize = 32ull << 20;
++#endif
+ 
+         res = vmaCreateAllocator(&allocatorInfo, &allocator);
+         if (res != VK_SUCCESS) {
+@@ -4203,12 +4544,22 @@ namespace plume {
+         return std::make_unique<VulkanSampler>(this, desc);
+     }
+ 
++    // A pipeline the driver refused (e.g. VK_ERROR_UNKNOWN from a mobile compiler) comes back as
++    // null instead of an object with a null handle that callers would bind.
+     std::unique_ptr<RenderPipeline> VulkanDevice::createComputePipeline(const RenderComputePipelineDesc &desc) {
+-        return std::make_unique<VulkanComputePipeline>(this, desc);
++        auto pipeline = std::make_unique<VulkanComputePipeline>(this, desc);
++        if (pipeline->vk == VK_NULL_HANDLE) {
++            return nullptr;
++        }
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> VulkanDevice::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
+-        return std::make_unique<VulkanGraphicsPipeline>(this, desc);
++        auto pipeline = std::make_unique<VulkanGraphicsPipeline>(this, desc);
++        if (pipeline->vk == VK_NULL_HANDLE) {
++            return nullptr;
++        }
++        return pipeline;
+     }
+ 
+     std::unique_ptr<RenderPipeline> VulkanDevice::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
+@@ -4255,6 +4606,10 @@ namespace plume {
+         return std::make_unique<VulkanQueryPool>(this, queryCount);
+     }
+ 
++    std::unique_ptr<RenderQueryPool> VulkanDevice::createOcclusionQueryPool(uint32_t queryCount) {
++        return std::make_unique<VulkanQueryPool>(this, queryCount, true);
++    }
++
+     void VulkanDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {
+         assert(meshes != nullptr);
+         assert(meshCount > 0);
+@@ -4463,6 +4818,11 @@ namespace plume {
+     void VulkanDevice::release() {
+         nullBuffer = nullptr; // force destruction before destroying allocator
+ 
++        if (pipelineCache != VK_NULL_HANDLE) {
++            vkDestroyPipelineCache(vk, pipelineCache, nullptr);
++            pipelineCache = VK_NULL_HANDLE;
++        }
++
+         if (allocator != VK_NULL_HANDLE) {
+             vmaDestroyAllocator(allocator);
+             allocator = VK_NULL_HANDLE;
+@@ -4495,7 +4855,27 @@ namespace plume {
+ #else
+     VulkanInterface::VulkanInterface() {
+ #endif
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++        // iOS has no loader: open the MoltenVK the app bundle carries (the same image the runtime
++        // opened, by the same path), since a bare dlopen name does not search the bundle.
++        VkResult res = VK_ERROR_INITIALIZATION_FAILED;
++        {
++            char exePath[4096];
++            uint32_t exePathSize = sizeof(exePath);
++            if (_NSGetExecutablePath(exePath, &exePathSize) == 0) {
++                std::string dir(exePath);
++                dir.resize(dir.rfind('/') + 1);
++                void *lib = dlopen((dir + "libMoltenVK.dylib").c_str(), RTLD_NOW | RTLD_LOCAL);
++                auto gipa = lib ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib, "vkGetInstanceProcAddr")) : nullptr;
++                if (gipa) {
++                    volkInitializeCustom(gipa);
++                    res = VK_SUCCESS;
++                }
++            }
++        }
++#else
+         VkResult res = volkInitialize();
++#endif
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "volkInitialize failed with error code 0x%X.\n", res);
+             return;
+@@ -4666,6 +5046,26 @@ namespace plume {
+         return instance != nullptr;
+     }
+ 
++    void SetVulkanPipelineCacheData(std::vector<uint8_t> data) {
++        pipelineCacheSeed() = std::move(data);
++    }
++
++    std::vector<uint8_t> GetVulkanPipelineCacheData(RenderDevice *device) {
++        auto *vulkanDevice = static_cast<VulkanDevice *>(device);
++        std::vector<uint8_t> data;
++        size_t size = 0;
++        if (vulkanDevice == nullptr || vulkanDevice->pipelineCache == VK_NULL_HANDLE ||
++            vkGetPipelineCacheData(vulkanDevice->vk, vulkanDevice->pipelineCache, &size, nullptr) != VK_SUCCESS) {
++            return data;
++        }
++        data.resize(size);
++        if (vkGetPipelineCacheData(vulkanDevice->vk, vulkanDevice->pipelineCache, &size, data.data()) != VK_SUCCESS) {
++            data.clear();
++        }
++        data.resize(size);
++        return data;
++    }
++
+     // Global creation function.
+ 
+ #if defined(PLUME_SDL2_VULKAN_ENABLED)
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 1d36b12..0de1495 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -279,14 +279,25 @@ namespace plume {
+         uint32_t getWidth() const override;
+         uint32_t getHeight() const override;
+         bool contains(const VulkanTexture *attachment) const;
++
++        // Load-op clear variants of renderPass (see g_clearLoadOps).
++        std::vector<VkAttachmentDescription> attachmentDescs;
++        std::vector<VkAttachmentReference> clearColorReferences;
++        std::vector<VkAttachmentReference> clearInputReferences;
++        VkAttachmentReference clearDepthReference = {};
++        bool hasDepthAttachment = false;
++        mutable std::mutex clearPassesMutex;
++        mutable std::unordered_map<uint32_t, VkRenderPass> clearPasses;
++        VkRenderPass clearPass(uint32_t mask) const;
+     };
+ 
+     struct VulkanQueryPool : RenderQueryPool {
+         VulkanDevice *device = nullptr;
+         std::vector<uint64_t> results;
+         VkQueryPool vk = VK_NULL_HANDLE;
++        bool occlusion = false;
+ 
+-        VulkanQueryPool(VulkanDevice *device, uint32_t queryCount);
++        VulkanQueryPool(VulkanDevice *device, uint32_t queryCount, bool occlusion = false);
+         virtual ~VulkanQueryPool() override;
+         virtual void queryResults() override;
+         virtual const uint64_t *getResults() const override;
+@@ -302,6 +313,11 @@ namespace plume {
+         const VulkanPipelineLayout *activeGraphicsPipelineLayout = nullptr;
+         const VulkanPipelineLayout *activeRaytracingPipelineLayout = nullptr;
+         VkRenderPass activeRenderPass = VK_NULL_HANDLE;
++        uint32_t pendingClearMask = 0;  // clears for the next pass's load ops (bit i: colour i, 8: depth, 9: stencil)
++        VkClearValue pendingClearValues[9] = {};
++        bool deferClear(const RenderRect *clearRects, uint32_t clearRectsCount);
++        uint32_t shadingRate = 0;  // (width << 4) | height of the last vkCmdSetFragmentShadingRateKHR
++        void setFragmentShadingRate(uint32_t width, uint32_t height) override;
+ 
+         VulkanCommandList(VulkanCommandQueue *queue);
+         ~VulkanCommandList() override;
+@@ -319,6 +335,7 @@ namespace plume {
+         void setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) override;
+         void setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) override;
+         void setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) override;
++        void setGraphicsDescriptorSetDynamic(RenderDescriptorSet *descriptorSet, uint32_t setIndex, const uint32_t *dynamicOffsets, uint32_t dynamicOffsetCount) override;
+         void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) override;
+         void setRaytracingPipelineLayout(const RenderPipelineLayout *pipelineLayout) override;
+         void setRaytracingPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset = 0, uint32_t size = 0) override;
+@@ -342,6 +359,8 @@ namespace plume {
+         void discardTexture(const RenderTexture* texture) override;
+         void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
+         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
++        void beginOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
++        void endOcclusionQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+         void checkActiveRenderPass();
+         void endActiveRenderPass();
+         void setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex);
+@@ -404,9 +423,11 @@ namespace plume {
+ 
+     struct VulkanDevice : RenderDevice {
+         VkDevice vk = VK_NULL_HANDLE;
++        VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+         VulkanInterface *renderInterface = nullptr;
+         VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+         VkPhysicalDeviceProperties physicalDeviceProperties = {};
++        bool occlusionQueryPrecise = false;
+         VmaAllocator allocator = VK_NULL_HANDLE;
+         uint32_t queueFamilyIndices[3] = {};
+         std::vector<VulkanQueueFamily> queueFamilies;
+@@ -416,6 +437,7 @@ namespace plume {
+         VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
+         std::unique_ptr<RenderBuffer> nullBuffer;
+         bool loadStoreOpNoneSupported = false;
++        bool fragmentShadingRateSupported = false;
+         bool nullDescriptorSupported = false;
+ 
+         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
+@@ -436,6 +458,7 @@ namespace plume {
+         std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
+         std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
+         std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
++        std::unique_ptr<RenderQueryPool> createOcclusionQueryPool(uint32_t queryCount) override;
+         void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override;
+         void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override;
+         void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override;
+@@ -466,4 +489,9 @@ namespace plume {
+         const std::vector<std::string> &getDeviceNames() const override;
+         bool isValid() const;
+     };
++
++    // Pipeline cache: seed data for devices created afterwards, and the current contents of a
++    // device's cache (to persist between runs). Cache creation failures fall back to no cache.
++    void SetVulkanPipelineCacheData(std::vector<uint8_t> data);
++    std::vector<uint8_t> GetVulkanPipelineCacheData(RenderDevice *device);
+ };
