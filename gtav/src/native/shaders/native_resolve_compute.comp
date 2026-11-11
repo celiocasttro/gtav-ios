@@ -1,0 +1,41 @@
+// gtav - native renderer: colour resolve as a compute dispatch (tile GPUs: MoltenVK on Apple).
+// Each render pass costs a Metal encoder with its tiling and tile load/store (~50 us of GPU idle
+// on the M1, even for a copy of a few texels); a compute dispatch next to the resolve's guest
+// memory writeback costs a fraction of that. Same conversion as PSResolve (native_blit.hlsl).
+#version 450
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform texture2D g_Textures[];
+layout(set = 1, binding = 0) uniform writeonly image2D g_Dest[];
+layout(push_constant) uniform Push {
+    uint Source;        // texture heap index of the source
+    uint Dest;          // storage index of the destination
+    ivec2 SourceOrigin;
+    ivec2 DestOrigin;
+    uvec2 Size;
+    float Scale;
+    uint Mode;  // 1: float channels re-encoded as 7e3 bit patterns
+} g_Push;
+
+// Xenos 7e3 (3-bit exponent, 7-bit mantissa, [0, 31.875]) from float, as Xenia converts it.
+uint Float32To7e3(float f) {
+    if (!(f > 0.0)) return 0u;
+    if (f >= 31.875) return 0x3FFu;
+    uint u = floatBitsToUint(f);
+    if (u < 0x3E800000u) {
+        u = (0x800000u | (u & 0x7FFFFFu)) >> (125u - (u >> 23));
+    } else {
+        u += 0xC2000000u;
+    }
+    return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0x3FFu;
+}
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= g_Push.Size.x || id.y >= g_Push.Size.y) return;
+    vec4 v = texelFetch(g_Textures[nonuniformEXT(g_Push.Source)], g_Push.SourceOrigin + ivec2(id), 0) * g_Push.Scale;
+    if (g_Push.Mode == 1u)
+        v = vec4(Float32To7e3(v.r) / 1023.0, Float32To7e3(v.g) / 1023.0, Float32To7e3(v.b) / 1023.0, clamp(v.a, 0.0, 1.0));
+    imageStore(g_Dest[nonuniformEXT(g_Push.Dest)], g_Push.DestOrigin + ivec2(id), v);
+}
