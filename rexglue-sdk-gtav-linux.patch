@@ -1,0 +1,3508 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..b3199ce 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -158,6 +158,10 @@ if(WIN32)
+         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
+     endif()
+     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
++elseif(ANDROID)
++    # Android (NDK): Linux kernel + Bionic; platform.h also sets REX_PLATFORM_ANDROID.
++    set(REX_PLATFORM "android-arm64")
++    add_compile_definitions(REX_PLATFORM_LINUX=1)
+ elseif(UNIX AND NOT APPLE)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "linux-amd64")
+@@ -170,6 +174,9 @@ elseif(UNIX AND NOT APPLE)
+ elseif(APPLE)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "mac-amd64")
++    elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++        set(REX_IOS TRUE)
++        set(REX_PLATFORM "ios-arm64")
+     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+         set(REX_PLATFORM "mac-arm64")
+     else()
+@@ -260,7 +267,10 @@ add_subdirectory(src/graphics)
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+ add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++# The codegen tool runs on the build host only; an iOS build is runtime libraries alone.
++if(NOT REX_IOS)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 622b924..2193531 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -99,8 +99,8 @@
+             "hidden": true,
+             "inherits": "mac-base",
+             "cacheVariables": {
+-                "CMAKE_C_FLAGS": "-march=armv8-a",
+-                "CMAKE_CXX_FLAGS": "-march=armv8-a",
++                "CMAKE_C_FLAGS": "-mcpu=apple-m1",
++                "CMAKE_CXX_FLAGS": "-mcpu=apple-m1",
+                 "CMAKE_OSX_ARCHITECTURES": "arm64"
+             }
+         },
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 41e6dce..a46a433 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -166,7 +166,7 @@ function(rexglue_configure_target target_name)
+         unset(_plugin_target)
+     endforeach()
+ 
+-    if(APPLE AND REXGLUE_USE_VULKAN)
++    if(APPLE AND REXGLUE_USE_VULKAN AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+         _rexglue_stage_macos_vulkan_runtime(${target_name})
+     endif()
+ endfunction()
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+index d9a64eb..cdf0918 100644
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -52,11 +52,13 @@ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
+ )
+ 
+ # A Debug codegen tool runs an order of magnitude slower, so only Release ships.
++if(TARGET rexglue)
+ install(TARGETS rexglue
+     EXPORT rexglueTargets
+     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+     CONFIGURATIONS Release
+ )
++endif()
+ 
+ if(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
+     install(TARGETS ${REXGLUE_INSTALL_FIDELITYFX_TARGETS}
+@@ -137,7 +139,7 @@ if(REXGLUE_USE_D3D12)
+     )
+ endif()
+ 
+-if(APPLE AND REXGLUE_USE_VULKAN)
++if(APPLE AND REXGLUE_USE_VULKAN AND NOT REX_IOS)
+     install(FILES "$<TARGET_FILE:Vulkan::Loader>"
+         DESTINATION ${CMAKE_INSTALL_LIBDIR}
+         CONFIGURATIONS Release
+diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
+index f8949ca..dfab846 100644
+--- a/include/rex/audio/sdl/sdl_audio_driver.h
++++ b/include/rex/audio/sdl/sdl_audio_driver.h
+@@ -11,9 +11,11 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <mutex>
+ #include <queue>
+ #include <stack>
++#include <thread>
+ 
+ #include <rex/audio/audio_driver.h>
+ #include <rex/thread.h>
+@@ -49,6 +51,21 @@ class SDLAudioDriver : public AudioDriver {
+   std::queue<float*> frames_queued_ = {};
+   std::stack<float*> frames_unused_ = {};
+   std::mutex frames_mutex_ = {};
++
++  // --audio_release_pacing: the callback banks one credit per consumed frame and this thread
++  // releases the guest semaphore once per frame period, so a device that takes several frames
++  // per callback (WASAPI shared mode: 10 ms) still sees one audio pass every 5.3 ms.
++  void PacerThread();
++  // Without a device (iOS audio session refused): frames consumed silently, device retried.
++  bool OpenDevice();
++  void CloseDevice();
++  void SilentThread();
++  std::thread silent_;
++  std::atomic<bool> silent_stop_{false};
++  std::thread pacer_;
++  std::atomic<bool> pacer_stop_{false};
++  std::atomic<int32_t> pending_releases_{0};
++  bool pacing_ = false;
+ };
+ 
+ }  // namespace rex::audio::sdl
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 8426798..90eabaa 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -279,6 +279,10 @@ class XmaContext {
+   AVPacket* av_packet_ = nullptr;
+   AVCodec* av_codec_ = nullptr;
+   AVCodecContext* av_context_ = nullptr;
++  // Opened contexts of other formats (sample rate, channels): sounds switch between a few, and
++  // opening one builds its MDCT / sine window / VLC tables (PrepareDecoder).
++  std::array<AVCodecContext*, 1> spare_contexts_{};  // ~450 KB each (8 channels of output)
++  uint32_t next_spare_ = 0;
+   AVFrame* av_frame_ = nullptr;
+ 
+   // Packet data buffer (two packets worth for split frame handling)
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..549bdf8 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,8 +116,8 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
+-// Apple libc++ does not expose clock_time_conversion or clock_cast.
++#if defined(__APPLE__) || defined(__ANDROID__)
++// libc++ (Apple, Android NDK) does not expose clock_time_conversion or clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index da8e432..749f0ba 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -254,6 +254,7 @@ class CommandProcessor {
+ 
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+   std::atomic<uint32_t> write_ptr_index_;
++  uint32_t lagged_ptr_ = 0;  // --gpu_skip_rendering_lag_ms: last write pointer old enough to run
+ 
+   // Some titles submit writes beyond the emulated register file range in PM4
+   // packets. Preserve these values so dependent packet logic can still observe
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 96d362b..0cb73ed 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -366,6 +366,17 @@ class D3D12CommandProcessor : public CommandProcessor {
+   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
+                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
+   bool IssueCopy_ReadbackResolvePath();
++  // gtav native-renderer comparison dumps (see the cvars in command_processor.cpp).
++  bool EmuDumpActive();
++  void DumpResolveForComparison(uint32_t address, uint32_t length, const uint8_t* data);
++  void DumpDrawConstantsForComparison(uint32_t prim, uint32_t count);
++  uint64_t emu_dump_target_ = 0, emu_dump_frame_ = 0;
++  uint32_t emu_dump_sequence_ = 0;
++  // Draw constants of the frame being dumped, written to its draws.bin once the frame is over
++  // (one file open per draw on a slow disk made every dumped frame take minutes).
++  void FlushDrawConstantsForComparison();
++  std::vector<uint8_t> emu_draw_constants_;
++  uint64_t emu_draw_constants_frame_ = 0;
+   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+ 
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..d087448 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -426,6 +426,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+ 
+   void ClearTransientDescriptorPools();
+   bool IssueCopy_ReadbackResolvePath();
++  void DumpResolveForComparison(uint32_t address, uint32_t length, const uint8_t* data);
++  void DumpDrawConstantsForComparison(uint32_t prim, uint32_t count);
++  uint32_t emu_dump_sequence_ = 0;
++  uint64_t emu_dump_frame_ = 0;
++  uint64_t emu_dump_target_ = 0;
++  bool EmuDumpActive();
+   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+ 
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..a68b9cc 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include <rex/input/device_assignment.h>
+@@ -65,6 +66,8 @@ class InputSystem : public system::IInputSystem {
+   // does not renumber pad two.
+   std::vector<DeviceInfo> devices_;
+   std::vector<InputDriver*> device_owners_;
++  // Serializes the public X* entry points (several guest threads poll input at once).
++  std::recursive_mutex mutex_;
+ };
+ 
+ /// Create a default InputSystem with SDL + NOP drivers.
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index e90418d..9f5d0f8 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -28,7 +28,12 @@
+ #include <TargetConditionals.h>
+ #endif
+ 
+-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
++// iOS is Darwin too: REX_PLATFORM_MAC stays set (BSD libc, Mach, MoltenVK on Metal) and
++// REX_PLATFORM_IOS subtracts the desktop-only pieces (AppKit, shm_open, a loader to dlopen).
++#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
++#define REX_PLATFORM_IOS 1
++#define REX_PLATFORM_MAC 1
++#elif defined(TARGET_OS_MAC) && TARGET_OS_MAC
+ #define REX_PLATFORM_MAC 1
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
+@@ -47,6 +52,9 @@
+ #ifndef REX_PLATFORM_MAC
+ #define REX_PLATFORM_MAC 0
+ #endif
++#ifndef REX_PLATFORM_IOS
++#define REX_PLATFORM_IOS 0
++#endif
+ #ifndef REX_PLATFORM_WIN32
+ #define REX_PLATFORM_WIN32 0
+ #endif
+diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
+index 0a43f07..a9bf21f 100644
+--- a/include/rex/system/xobject.h
++++ b/include/rex/system/xobject.h
+@@ -189,6 +189,8 @@ class XObject {
+ 
+   void SetAttributes(uint32_t obj_attributes_ptr);
+ 
++  void ReportLongWait();
++  void TraceHandleOp(const char* op);
+   X_STATUS Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                 uint64_t* opt_timeout);
+   static X_STATUS SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 352af67..2f6123f 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -57,7 +57,13 @@ struct Fiber {
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_ANDROID
++  // Bionic has no getcontext/makecontext/swapcontext: fiber_posix.cpp switches stacks itself and
++  // keeps the callee-saved registers on the suspended fiber's stack.
++  void* sp_ = nullptr;
++#else
+   ucontext_t context_{};
++#endif
+   std::vector<uint8_t> stack_;
+   void (*entry_)(void*) = nullptr;
+   void* arg_ = nullptr;
+diff --git a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
+new file mode 100644
+index 0000000..a721b58
+--- /dev/null
++++ b/include/rex/ui/surface_android.h
+@@ -0,0 +1,31 @@
++#pragma once
++/**
++ * @file        rex/ui/surface_android.h
++ * @brief       Android ANativeWindow surface (from SDL3's Android window)
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include <rex/ui/surface.h>
++
++struct ANativeWindow;
++
++namespace rex {
++namespace ui {
++
++class AndroidNativeWindowSurface final : public Surface {
++ public:
++  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {}
++  TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
++  ANativeWindow* window() const { return window_; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
++
++ private:
++  ANativeWindow* window_;
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/include/rex/ui/windowed_app.h b/include/rex/ui/windowed_app.h
+index 50638d6..feec200 100644
+--- a/include/rex/ui/windowed_app.h
++++ b/include/rex/ui/windowed_app.h
+@@ -24,10 +24,7 @@
+ #include <rex/platform.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+-#if REX_PLATFORM_ANDROID
+-// Multiple apps in a single library instead of separate executables.
+-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
+-#endif
++// Android: one app per library too (the game's libmain.so; SDL's activity calls its SDL_main).
+ 
+ namespace rex {
+ namespace ui {
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index 68274d2..610fab2 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -262,6 +262,12 @@ extern PPCFuncMapping PPCFuncMappings[];
+ 
+ #define REX_QUERY_TIMEBASE() rex::chrono::Clock::QueryGuestTickCount()
+ 
++// Memory barriers (sync, lwsync, eieio). x86: lwsync/eieio need no instruction, only a compiler
++// barrier; ARM64: dmb ish (lwsync orders everything but store->load, which a full dmb covers).
++#define REX_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#define REX_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
++#define REX_EIEIO() __atomic_thread_fence(__ATOMIC_RELEASE)
++
+ //=============================================================================
+ // Setjmp/Longjmp
+ //=============================================================================
+diff --git a/resources/templates/test/ppc_config_h.inja b/resources/templates/test/ppc_config_h.inja
+index 0c334f8..8a62c96 100644
+--- a/resources/templates/test/ppc_config_h.inja
++++ b/resources/templates/test/ppc_config_h.inja
+@@ -118,6 +118,9 @@
+   throw std::runtime_error("Unimplemented PPC instruction: " opcode)
+ 
+ #define REX_QUERY_TIMEBASE() rex::chrono::Clock::QueryGuestTickCount()
++#define REX_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#define REX_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
++#define REX_EIEIO() __atomic_thread_fence(__ATOMIC_RELEASE)
+ 
+ //=============================================================================
+ // Setjmp/Longjmp
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..6aef51f 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,10 +11,19 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
++#include <cstdio>
++#include <condition_variable>
+ #include <cstring>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/conversion.h>
++#include <cmath>
++
+ #include <rex/audio/downmix.h>
+ #include <rex/audio/flags.h>
+ #include <rex/audio/sdl/sdl_audio_driver.h>
+@@ -24,7 +33,36 @@
+ #include <rex/perf/counter.h>
+ #include <SDL3/SDL.h>
+ 
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++// WASAPI shared mode ignores the period hint and takes two guest frames per 10 ms callback.
++#define REX_AUDIO_PACING_DEFAULT true
++#else
++#define REX_AUDIO_PACING_DEFAULT false
++#endif
++
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_BOOL(audio_release_pacing, REX_AUDIO_PACING_DEFAULT, "Audio",
++                    "Hand consumed frames back to the guest one per 5.3 ms instead of in bursts per device callback");
++// Android: phones are stereo, and a 6-channel stream costs the audio server ~40% of a core to fold.
++#if defined(__APPLE__) || defined(__ANDROID__)
++#define REX_AUDIO_FORCE_STEREO_DEFAULT true
++#else
++#define REX_AUDIO_FORCE_STEREO_DEFAULT false
++#endif
++REXCVAR_DEFINE_BOOL(audio_force_stereo, REX_AUDIO_FORCE_STEREO_DEFAULT, "Audio",
++                    "Submit the stereo fold even when the device reports more channels (macOS reports 6 for "
++                    "built-in stereo speakers and its own 5.1 fold drops the centre channel: no dialogue)");
++REXCVAR_DEFINE_INT32(audio_device_frames, 256, "Audio",
++                     "Audio device period in samples (0 = SDL default); one guest frame is 256");
++REXCVAR_DEFINE_STRING(audio_dump_raw, "", "Audio",
++                      "Append the device mix (float32, interleaved, device rate/channels) to this file, also when muted");
+ 
+ namespace rex::audio::sdl {
+ 
+@@ -39,6 +77,12 @@ SDLAudioDriver::~SDLAudioDriver() {
+ bool SDLAudioDriver::Initialize() {
+   // Set audio category for proper OS audio handling
+   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
++  // One guest frame (256 samples, 5.3 ms) per device callback: with the default ~1024-sample
++  // period the callback took four frames at once, so the guest's audio engine ran four passes
++  // back to back and then none for ~16 ms. Games that wait for an audio pass every frame (GTA V's
++  // update thread) then ran at most two frames per period.
++  if (REXCVAR_GET(audio_device_frames) > 0)
++    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, std::to_string(REXCVAR_GET(audio_device_frames)).c_str());
+ 
+   // Set app name for audio device identification
+   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
+@@ -49,6 +93,25 @@ bool SDLAudioDriver::Initialize() {
+   }
+   sdl_initialized_ = true;
+ 
++  // iOS refuses the audio session now and then (app launched while not in front, another app
++  // holding the audio): without a device the game's audio objects stayed null and it crashed at
++  // start (guest read of 0x6C). Without a device the frames are consumed silently at the device
++  // rate (the guest's audio engine keeps its pace) and the device is retried every 2 s.
++  pacing_ = REXCVAR_GET(audio_release_pacing);
++  if (!OpenDevice()) {
++    REXAPU_WARN("no audio device yet: running silent, retrying every 2 s");
++    silent_stop_ = false;
++    silent_ = std::thread([this] { SilentThread(); });
++  }
++
++  if (pacing_) {
++    pacer_stop_ = false;
++    pacer_ = std::thread([this] { PacerThread(); });
++  }
++  return true;
++}
++
++bool SDLAudioDriver::OpenDevice() {
+   SDL_AudioSpec desired_spec = {};
+   SDL_AudioSpec obtained_spec = {};
+   desired_spec.freq = frame_frequency_;
+@@ -59,12 +122,14 @@ bool SDLAudioDriver::Initialize() {
+                                           SDLCallback, this);
+   if (!sdl_stream_) {
+     REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {}", SDL_GetError());
++    CloseDevice();
+     return false;
+   }
+ 
+   SDL_AudioDeviceID sdl_device = SDL_GetAudioStreamDevice(sdl_stream_);
+   if (!sdl_device) {
+     REXAPU_ERROR("SDL_GetAudioStreamDevice() failed: {}", SDL_GetError());
++    CloseDevice();
+     return false;
+   }
+ 
+@@ -75,7 +140,7 @@ bool SDLAudioDriver::Initialize() {
+ 
+   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
+   // Handing it a 6ch stream instead would use SDL's own downmix.
+-  if (obtained_spec.channels <= 2) {
++  if (obtained_spec.channels <= 2 || REXCVAR_GET(audio_force_stereo)) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+     desired_spec.channels = 2;
+@@ -84,12 +149,14 @@ bool SDLAudioDriver::Initialize() {
+                                             SDLCallback, this);
+     if (!sdl_stream_) {
+       REXAPU_ERROR("SDL_OpenAudioDeviceStream() stereo fallback failed: {}", SDL_GetError());
+-      return false;
++      CloseDevice();
++    return false;
+     }
+     sdl_device = SDL_GetAudioStreamDevice(sdl_stream_);
+     if (!sdl_device) {
+       REXAPU_ERROR("SDL_GetAudioStreamDevice() failed after stereo fallback: {}", SDL_GetError());
+-      return false;
++      CloseDevice();
++    return false;
+     }
+   }
+ 
+@@ -103,12 +170,93 @@ bool SDLAudioDriver::Initialize() {
+ 
+   if (!SDL_ResumeAudioDevice(sdl_device)) {
+     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
++    CloseDevice();
+     return false;
+   }
+ 
+   return true;
+ }
+ 
++void SDLAudioDriver::CloseDevice() {
++  if (sdl_stream_) {
++    SDL_DestroyAudioStream(sdl_stream_);
++    sdl_stream_ = nullptr;
++  }
++}
++
++// No device (see Initialize): one frame per device period is taken from the queue and released to
++// the guest as the callback would, and the device is retried every 2 s; once it opens, the
++// callback takes over.
++void SDLAudioDriver::SilentThread() {
++  using Clock = std::chrono::steady_clock;
++  const auto period = std::chrono::nanoseconds(1000000000ll * channel_samples_ / frame_frequency_);
++  auto next = Clock::now(), retry = next + std::chrono::seconds(2);
++  while (!silent_stop_.load(std::memory_order_relaxed)) {
++    next += period;
++    auto now = Clock::now();
++    if (next < now - 4 * period) next = now;
++    if (next > now) std::this_thread::sleep_until(next);
++    if (now >= retry) {
++      retry = now + std::chrono::seconds(2);
++      if (OpenDevice()) {
++        REXAPU_INFO("audio device opened: sound on");
++        return;
++      }
++    }
++    bool released = false;
++    {
++      std::unique_lock<std::mutex> guard(frames_mutex_);
++      if (!frames_queued_.empty()) {
++        frames_unused_.push(frames_queued_.front());
++        frames_queued_.pop();
++        released = true;
++      }
++    }
++    if (!released) continue;
++    if (pacing_) {
++      pending_releases_.fetch_add(1, std::memory_order_acq_rel);
++    } else {
++      semaphore_->Release(1, nullptr);
++    }
++  }
++}
++
++void SDLAudioDriver::PacerThread() {
++  using Clock = std::chrono::steady_clock;
++  const auto period = std::chrono::nanoseconds(1000000000ll * channel_samples_ / frame_frequency_);
++#ifdef _WIN32
++  SetThreadDescription(GetCurrentThread(), L"Audio pacer");
++  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++  HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++#endif
++  auto next = Clock::now();
++  while (!pacer_stop_.load(std::memory_order_relaxed)) {
++    next += period;
++    auto now = Clock::now();
++    if (next < now - 4 * period) next = now;  // stalled (debugger, suspend): don't burst to catch up
++    if (next > now) {
++#ifdef _WIN32
++      if (timer) {
++        LARGE_INTEGER due;
++        due.QuadPart = -std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(next - now).count() / 100);
++        SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0);
++        WaitForSingleObject(timer, INFINITE);
++      } else
++#endif
++        std::this_thread::sleep_until(next);
++    }
++    // One frame per period; more when credits pile up (this clock slower than the device's).
++    int32_t pending = pending_releases_.load(std::memory_order_acquire);
++    if (pending <= 0) continue;
++    int32_t n = pending > 2 ? pending - 1 : 1;
++    pending_releases_.fetch_sub(n, std::memory_order_acq_rel);
++    semaphore_->Release(n, nullptr);
++  }
++#ifdef _WIN32
++  if (timer) CloseHandle(timer);
++#endif
++}
++
+ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
+   float* output_frame;
+@@ -139,6 +287,14 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+ }
+ 
+ void SDLAudioDriver::Shutdown() {
++  if (silent_.joinable()) {
++    silent_stop_ = true;
++    silent_.join();
++  }
++  if (pacer_.joinable()) {
++    pacer_stop_ = true;
++    pacer_.join();
++  }
+   if (sdl_stream_) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+@@ -158,6 +314,58 @@ void SDLAudioDriver::Shutdown() {
+   }
+ }
+ 
++namespace {
++// --audio_dump_raw: the callback only appends to memory; a writer thread does the file I/O
++// (fwrite on a busy disk inside the callback stalled the device to ~0.4x real time).
++class RawDump {
++ public:
++  static RawDump* Get() {
++    static RawDump* dump = [] {
++      const std::string path = REXCVAR_GET(audio_dump_raw);
++      return path.empty() ? nullptr : new RawDump(path);
++    }();
++    return dump;
++  }
++  void Append(const void* data, size_t len) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!started_) {
++      started_ = true;
++      REXAPU_INFO("audio dump starts at steady ms {}",
++                  uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch())
++                               .count()));
++    }
++    auto p = static_cast<const uint8_t*>(data);
++    pending_.insert(pending_.end(), p, p + len);
++    cv_.notify_one();
++  }
++
++ private:
++  explicit RawDump(const std::string& path) : file_(std::fopen(path.c_str(), "wb")) {
++    std::thread([this] {
++      std::vector<uint8_t> out;
++      for (;;) {
++        {
++          std::unique_lock<std::mutex> lock(mutex_);
++          cv_.wait(lock, [this] { return pending_.size() >= (64u << 10); });
++          out.swap(pending_);
++        }
++        if (file_) {
++          std::fwrite(out.data(), 1, out.size(), file_);
++          std::fflush(file_);
++        }
++        out.clear();
++      }
++    }).detach();
++  }
++  FILE* file_;
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::vector<uint8_t> pending_;
++  bool started_ = false;
++};
++}  // namespace
++
+ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
+                                  [[maybe_unused]] int total_amount) {
+   SCOPE_profile_cpu_f("apu");
+@@ -178,15 +386,33 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+   const StereoFold fold = GetStereoFold();
+   const SurroundMix mix = GetSurroundMix();
+   const float gain = GetOutputGain();
++  // gtav: audio health, once per ~10 s of output: silence fills mean the guest delivered late
++  // (dropouts), a deep queue means it delivered in bursts (latency).
++  static uint32_t stat_frames = 0, stat_silence = 0, stat_max_queued = 0;
++  static float stat_peak[6] = {};
+   while (additional_amount > 0) {
+     static uint32_t sdl_callback_count = 0;
+     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
++    stat_max_queued = std::max(stat_max_queued, uint32_t(driver->frames_queued_.size()));
++    if (++stat_frames >= 1875) {  // 256-sample frames at 48 kHz
++      // Per-channel peaks of the guest's 5.1 render (before the fold), dBFS: shows a channel the
++      // game leaves empty (FL FR FC LFE BL BR).
++      auto db = [](float p) { return p > 1e-6f ? 20.0f * std::log10(p) : -120.0f; };
++      REXAPU_INFO("audio: {} of {} frames were silence (guest late), max {} queued; peak dB "
++                  "FL {:.0f} FR {:.0f} FC {:.0f} LFE {:.0f} BL {:.0f} BR {:.0f}",
++                  stat_silence, stat_frames, stat_max_queued, db(stat_peak[0]), db(stat_peak[1]),
++                  db(stat_peak[2]), db(stat_peak[3]), db(stat_peak[4]), db(stat_peak[5]));
++      stat_frames = stat_silence = stat_max_queued = 0;
++      for (float& p : stat_peak) p = 0;
++    }
+     if (driver->frames_queued_.empty()) {
++      stat_silence++;
+       if (sdl_callback_count < 10) {
+         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+         sdl_callback_count++;
+       }
+       std::memset(data, 0, len);
++      if (RawDump* dump = RawDump::Get()) dump->Append(data, size_t(len));
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
+         break;
+@@ -195,9 +421,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+     } else {
+       auto buffer = driver->frames_queued_.front();
+       driver->frames_queued_.pop();
+-      if (REXCVAR_GET(audio_mute)) {
+-        std::memset(data, 0, len);
+-      } else {
++      for (uint32_t c = 0; c < 6; ++c) {
++        const float* ch = buffer + c * channel_samples_;
++        for (uint32_t i = 0; i < channel_samples_; ++i)
++          stat_peak[c] = std::max(stat_peak[c], std::fabs(rex::byte_swap(ch[i])));
++      }
++      {
+         switch (driver->sdl_device_channels_) {
+           case 2:
+             conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
+@@ -211,6 +440,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+             assert_unhandled_case(driver->sdl_device_channels_);
+             break;
+         }
++        if (RawDump* dump = RawDump::Get()) dump->Append(data, size_t(len));
++        if (REXCVAR_GET(audio_mute)) std::memset(data, 0, len);
+       }
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
+@@ -219,8 +450,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+       }
+       driver->frames_unused_.push(buffer);
+ 
+-      auto ret = driver->semaphore_->Release(1, nullptr);
+-      assert_true(ret);
++      if (driver->pacing_) {
++        driver->pending_releases_.fetch_add(1, std::memory_order_acq_rel);
++      } else {
++        auto ret = driver->semaphore_->Release(1, nullptr);
++        assert_true(ret);
++      }
+       additional_amount -= len;
+     }
+   }
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..e2bb4c2 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -9,12 +9,20 @@
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ */
+ 
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
+ #include <algorithm>
+ #include <cstring>
++#include <map>
++#include <thread>
++#include <utility>
++#include <vector>
+ 
+ #include <rex/audio/xma/context.h>
+ #include <rex/audio/xma/decoder.h>
+ #include <rex/audio/xma/helpers.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/memory/ring_buffer.h>
+@@ -36,10 +44,130 @@ extern "C" {
+ // Credits for most of this code goes to:
+ // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
+ 
++// Loud audio burst hunt (gtav): xma_trace logs each context's decoded frames that are near full
++// scale or jump 20 dB over that context's previous frame, plus every "starved on input" reset;
++// xma_starved_reset=false turns that reset off for an A/B run.
++// Off: flushing (ffmpeg-gtav.patch xmaframes_flush, even with the full fresh-context reset) gave
++// 13-16 audio bursts in the scripted boot capture where reopening gave 4 (audio_bursts.py, 10-30);
++// reopening costs the audio thread ~20% (table setup) but that thread does not limit the fps.
++REXCVAR_DEFINE_BOOL(xma_flush_streams, false, "Audio",
++                    "Experiment: a new XMA stream flushes the decoder instead of reopening it (rebuilding its "
++                    "tables); more audio bursts in tests");
++REXCVAR_DEFINE_INT32(xma_fresh_contexts, 3, "Audio",
++                     "Decoder contexts per format kept opened ahead on a background thread: a new XMA stream "
++                     "takes one instead of reopening its own (same fresh state, without rebuilding the codec "
++                     "tables on the audio thread); 0 = reopen in place");
++REXCVAR_DEFINE_BOOL(xma_trace, false, "Audio", "Log loud decoded XMA frames and starved-input resets");
++REXCVAR_DEFINE_STRING(xma_dump_raw, "", "Audio", "Write every decoded XMA frame (with context and rate) to this file");
++REXCVAR_DEFINE_BOOL(xma_starved_reset, true, "Audio",
++                    "Reset output write_offset to read_offset when a context runs out of input");
++
+ namespace rex::audio {
+ 
+ using stream::BitStream;
+ 
++namespace {
++// Peak |sample| of a converted frame (big-endian int16).
++uint32_t FramePeak(const uint8_t* frame, size_t bytes) {
++  uint32_t peak = 0;
++  for (size_t i = 0; i + 1 < bytes; i += 2) {
++    int32_t v = int16_t(uint16_t(frame[i]) << 8 | frame[i + 1]);
++    peak = std::max<uint32_t>(peak, uint32_t(v < 0 ? -v : v));
++  }
++  return peak;
++}
++
++// Freshly opened decoder contexts by (sample rate, channels), made on a background thread, and
++// contexts to free there. Opening builds the codec's MDCT/sine/VLC tables (~20% of the game's
++// audio thread on a phone); a pre-opened context is the same fresh state as a reopen.
++class FreshContexts {
++ public:
++  static FreshContexts& Get() {
++    static FreshContexts* instance = new FreshContexts();  // lives for the process
++    return *instance;
++  }
++  // A fresh opened context for the format, or nullptr (the caller opens one). Asks for more.
++  AVCodecContext* Take(const AVCodec* codec, int sample_rate, int channels) {
++    const int want = REXCVAR_GET(xma_fresh_contexts);
++    if (want <= 0) return nullptr;
++    std::lock_guard lock(mutex_);
++    codec_ = codec;
++    auto& pool = pools_[{sample_rate, channels}];
++    AVCodecContext* context = nullptr;
++    if (!pool.empty()) {
++      context = pool.back();
++      pool.pop_back();
++    }
++    Start();
++    cv_.notify_one();
++    return context;
++  }
++  void Free(AVCodecContext* context) {
++    if (!context) return;
++    std::lock_guard lock(mutex_);
++    if (!started_) {
++      avcodec_free_context(&context);
++      return;
++    }
++    to_free_.push_back(context);
++    cv_.notify_one();
++  }
++
++ private:
++  void Start() {  // mutex_ held
++    if (started_) return;
++    started_ = true;
++    std::thread([this] { Run(); }).detach();
++  }
++  void Run() {
++    std::unique_lock lock(mutex_);
++    for (;;) {
++      cv_.wait(lock, [&] { return !to_free_.empty() || Missing() != nullptr; });
++      while (!to_free_.empty()) {
++        AVCodecContext* context = to_free_.back();
++        to_free_.pop_back();
++        lock.unlock();
++        avcodec_free_context(&context);
++        lock.lock();
++      }
++      while (auto* key = Missing()) {
++        const auto format = *key;
++        const AVCodec* codec = codec_;
++        lock.unlock();
++        AVCodecContext* context = avcodec_alloc_context3(codec);
++        if (context) {
++          context->sample_rate = format.first;
++          context->channels = format.second;
++          context->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
++          if (avcodec_open2(context, codec, NULL) < 0) avcodec_free_context(&context);
++        }
++        lock.lock();
++        if (!context) {
++          failed_ = true;  // (never seen) the callers open their own from now on
++          break;
++        }
++        pools_[format].push_back(context);
++      }
++    }
++  }
++  const std::pair<int, int>* Missing() {  // mutex_ held: a format below its count
++    const size_t want = size_t(std::max(REXCVAR_GET(xma_fresh_contexts), 0));
++    if (failed_) return nullptr;
++    for (auto& [format, pool] : pools_)
++      if (pool.size() < want) return &format;
++    return nullptr;
++  }
++
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::map<std::pair<int, int>, std::vector<AVCodecContext*>> pools_;
++  std::vector<AVCodecContext*> to_free_;
++  const AVCodec* codec_ = nullptr;
++  bool started_ = false;
++  bool failed_ = false;
++};
++}  // namespace
++
+ const uint32_t XmaContext::kBitsPerPacketHeader;
+ const uint32_t XmaContext::kOutputMaxSizeBytes;
+ 
+@@ -50,6 +178,9 @@ XmaContext::~XmaContext() {
+   if (av_context_) {
+     avcodec_free_context(&av_context_);
+   }
++  for (auto& spare : spare_contexts_) {
++    if (spare) avcodec_free_context(&spare);
++  }
+   if (av_frame_) {
+     av_frame_free(&av_frame_);
+   }
+@@ -117,6 +248,9 @@ bool XmaContext::Work() {
+     }
+     Consume(&output_rb, &data);
+     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++    if (output_rb.empty()) {
++      data.output_buffer_valid = 0;
++    }
+     StoreContextMerged(data, initial_data, context_ptr);
+     return true;
+   }
+@@ -133,17 +267,42 @@ bool XmaContext::Work() {
+   }
+ 
+   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
++    const uint32_t pre_decode_offset = data.input_buffer_read_offset;
++    const uint8_t pre_remaining_subframes = current_frame_remaining_subframes_;
++
+     Decode(&data);
+     Consume(&output_rb, &data);
+ 
+-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
++    // Don't abandon a partially consumed frame (xenia-canary fix). Consume() hands over at most
++    // subframe_decode_count blocks per pass, so the pass that exhausts the input usually leaves
++    // the rest of the last frame undelivered; nothing would kick the context again to deliver it
++    // and the game's stream never finishes (GTA V cutscene audio hang).
++    if ((!data.IsAnyInputBufferValid() || data.error_status == 4) &&
++        current_frame_remaining_subframes_ == 0) {
++      break;
++    }
++
++    // No progress: Decode didn't advance and no frame is pending.
++    if (pre_remaining_subframes == 0 && data.input_buffer_read_offset == pre_decode_offset &&
++        current_frame_remaining_subframes_ == 0) {
+       break;
+     }
+   }
+ 
+-  data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++  if (initial_data.IsAnyInputBufferValid()) {
++    data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++  } else if (REXCVAR_GET(xma_starved_reset) &&
++             data.output_buffer_write_offset != data.output_buffer_read_offset) {
++    // Starved on input: games use write_offset == read_offset as a stall detector.
++    if (REXCVAR_GET(xma_trace))
++      REXLOG_INFO("xma: ctx {} starved on input, write offset {} -> read offset {}", id_,
++                  uint32_t(data.output_buffer_write_offset), uint32_t(data.output_buffer_read_offset));
++    data.output_buffer_write_offset = data.output_buffer_read_offset;
++    data.output_buffer_valid = 0;
++  }
+ 
+-  if (output_rb.empty()) {
++  // Output buffer full.
++  if (remaining_subframe_blocks_in_output_buffer_ == 0 && output_rb.empty()) {
+     data.output_buffer_valid = 0;
+   }
+ 
+@@ -192,13 +351,16 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
+ void XmaContext::ResetDecoderState() {
+   // A freed or re-initialized context is a new logical stream, so the previous
+   // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
+-  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
+-  // flush callback, so the call never reaches the code clearing channel[].out.
+-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
+-  // next decode, which does discard the history.
+-  if (av_context_) {
+-    av_context_->sample_rate = 0;
+-    av_context_->channels = 0;
++  // ff_xmaframes_decoder's flush callback (ffmpeg-gtav.patch) clears it and the
++  // rest of the stream state, like a reopen without rebuilding the codec's tables
++  // (reopening for every sound was ~20% of the audio thread on a phone).
++  if (av_context_ && av_context_->sample_rate) {
++    if (REXCVAR_GET(xma_flush_streams)) {
++      avcodec_flush_buffers(av_context_);
++    } else {  // makes PrepareDecoder reopen the codec on the next decode
++      av_context_->sample_rate = 0;
++      av_context_->channels = 0;
++    }
+   }
+   raw_frame_.fill(0);
+   decoded_frame_.fill(0);
+@@ -476,7 +638,30 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
+       av_context_->channels != static_cast<int>(channels)) {
+     REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
+                        av_context_->sample_rate, sample_rate, av_context_->channels, channels);
+-    avcodec_free_context(&av_context_);
++    for (auto& spare : spare_contexts_) {
++      if (REXCVAR_GET(xma_flush_streams) && spare && spare->sample_rate == sample_rate &&
++          spare->channels == static_cast<int>(channels)) {
++        std::swap(av_context_, spare);  // the current one is kept for its format
++        if (!spare->sample_rate) avcodec_free_context(&spare);  // never opened
++        avcodec_flush_buffers(av_context_);  // a new stream
++        return 1;
++      }
++    }
++    if (av_context_->sample_rate && REXCVAR_GET(xma_flush_streams)) {  // keep it, replacing the oldest spare
++      auto& slot = spare_contexts_[next_spare_++ % spare_contexts_.size()];
++      if (slot) avcodec_free_context(&slot);
++      slot = av_context_;
++    } else if (!REXCVAR_GET(xma_flush_streams)) {
++      if (AVCodecContext* fresh = FreshContexts::Get().Take(av_codec_, sample_rate, int(channels))) {
++        FreshContexts::Get().Free(av_context_);
++        av_context_ = fresh;
++        return 1;
++      }
++      FreshContexts::Get().Free(av_context_);
++      av_context_ = nullptr;
++    } else {
++      avcodec_free_context(&av_context_);
++    }
+     av_context_ = avcodec_alloc_context3(av_codec_);
+ 
+     av_context_->sample_rate = sample_rate;
+@@ -670,6 +855,35 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+   if (decoded) {
+     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
+                  decoded_frame_.data());
++    // --xma_dump_raw=PATH: every decoded frame as {u32 context, u32 sample rate, u32 channels,
++    // u32 samples per channel, u32 steady-clock ms} + the big-endian int16 PCM the guest reads, to
++    // tell decoder artifacts from the game mixer's. The clock lines up with --audio_dump_raw's
++    // "audio dump starts at steady ms" log line.
++    if (const std::string& path = REXCVAR_GET(xma_dump_raw); !path.empty()) {
++      static std::mutex dump_mutex;
++      static FILE* dump = nullptr;
++      std::lock_guard lock(dump_mutex);
++      if (!dump) dump = std::fopen(path.c_str(), "wb");
++      if (dump) {
++        const uint32_t ms = uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                         std::chrono::steady_clock::now().time_since_epoch())
++                                         .count());
++        uint32_t header[5] = {id_, uint32_t(av_context_->sample_rate), 1u + uint32_t(data->is_stereo),
++                              uint32_t(kSamplesPerFrame), ms};
++        std::fwrite(header, sizeof(header), 1, dump);
++        std::fwrite(decoded_frame_.data(), 1, kBytesPerFrameChannel << data->is_stereo, dump);
++      }
++    }
++    if (REXCVAR_GET(xma_trace)) {
++      static uint32_t last_peak[512];
++      uint32_t& last = last_peak[id_ & 511];
++      const uint32_t peak = FramePeak(decoded_frame_.data(), kBytesPerFrameChannel << data->is_stereo);
++      if (peak >= 29000 || (peak >= 3000 && peak > last * 10))
++        REXLOG_INFO("xma: ctx {} loud frame peak {} (previous {}), stereo {}, input offset {}, out w/r {}/{}",
++                    id_, peak, last, uint32_t(data->is_stereo), uint32_t(data->input_buffer_read_offset),
++                    uint32_t(data->output_buffer_write_offset), uint32_t(data->output_buffer_read_offset));
++      last = peak;
++    }
+ 
+     // Realign the decoder's output onto the bitstream's sample numbering: the
+     // samples of the frame just decoded run from kDecoderStartPadding into this
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index b2d70f5..a101ca6 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -30,21 +30,22 @@ bool build_attn(BuilderContext& ctx) {
+   return true;
+ }
+ 
++// The barriers become REX_SYNC / REX_LWSYNC / REX_EIEIO (pch_h.inja): on x86 (strongly
++// ordered) lwsync and eieio only stop the compiler moving guest loads and stores across them,
++// but ARM64 reorders stores, so a lock released with "lwsync; stw 0" would publish the unlock
++// before the writes made under the lock without a dmb.
+ bool build_sync(BuilderContext& ctx) {
+-  // Memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tREX_SYNC();");
+   return true;
+ }
+ 
+ bool build_lwsync(BuilderContext& ctx) {
+-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tREX_LWSYNC();");
+   return true;
+ }
+ 
+ bool build_eieio(BuilderContext& ctx) {
+-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  ctx.println("\tREX_EIEIO();");
+   return true;
+ }
+ 
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index cbdd7f7..6b9067c 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -113,15 +113,29 @@ bool build_vnmsubfp(BuilderContext& ctx) {
+   return true;
+ }
+ 
++// AltiVec vmaxfp/vminfp return a QNaN when either operand is a NaN; SSE maxps/minps return the
++// second operand instead, so a clamp like max(min(x, 1), 0) turned NaN into 1.0 (GTA V: audio
++// gains/filters that are NaN on the console played at full level). Select a NaN (a + b) there.
++static void emit_vec_fp_minmax_nan(BuilderContext& ctx, const char* simd_op) {
++  auto vD = ctx.v(ctx.insn.operands[0]);
++  auto vA = ctx.v(ctx.insn.operands[1]);
++  auto vB = ctx.v(ctx.insn.operands[2]);
++  ctx.println("\t{{ simde__m128 a_ = simde_mm_load_ps({}.f32), b_ = simde_mm_load_ps({}.f32);", vA, vB);
++  ctx.println("\t  simde__m128 n_ = simde_mm_cmpunord_ps(a_, b_);");
++  ctx.println("\t  simde_mm_store_ps({}.f32, simde_mm_or_ps(simde_mm_andnot_ps(n_, simde_mm_{}_ps(a_, b_)), "
++              "simde_mm_and_ps(n_, simde_mm_add_ps(a_, b_)))); }}",
++              vD, simd_op);
++}
++
+ bool build_vmaxfp(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(true);
+-  ctx.emit_vec_fp_binary("max");
++  emit_vec_fp_minmax_nan(ctx, "max");
+   return true;
+ }
+ 
+ bool build_vminfp(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(true);
+-  ctx.emit_vec_fp_binary("min");
++  emit_vec_fp_minmax_nan(ctx, "min");
+   return true;
+ }
+ 
+@@ -163,9 +177,18 @@ bool build_vexptefp(BuilderContext& ctx) {
+   ctx.println("\t\tsimde__m128i exp_bits = simde_mm_slli_epi32(");
+   ctx.println("\t\t\tsimde_mm_add_epi32(simde_mm_cvttps_epi32(n), simde_mm_set1_epi32(127)), 23);");
+   ctx.println(
+-      "\t\tsimde_mm_store_ps({}.f32, "
+-      "simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits)));",
+-      vD);
++      "\t\tsimde__m128 r = simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits));");
++  // Out of range the exponent bits above wrap: 2^-200 came out as -7e16 and 2^-inf as NaN, so
++  // pow(x, y) = 2^(y log2 x) for x near 0 (GTA V audio gains) gave huge gains instead of 0.
++  // AltiVec: below the normal range 0 (non-Java mode flushes the denormals), from 128 +inf,
++  // NaN stays NaN.
++  ctx.println(
++      "\t\tr = simde_mm_andnot_ps(simde_mm_cmplt_ps(x, simde_mm_set1_ps(-126.0f)), r);");
++  ctx.println(
++      "\t\tr = simde_mm_blendv_ps(r, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7F800000)), "
++      "simde_mm_cmpge_ps(x, simde_mm_set1_ps(128.0f)));");
++  ctx.println("\t\tr = simde_mm_blendv_ps(r, x, simde_mm_cmpunord_ps(x, x));");
++  ctx.println("\t\tsimde_mm_store_ps({}.f32, r);", vD);
+   ctx.println("\t}}");
+   return true;
+ }
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..055910f 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -98,7 +98,10 @@ target_include_directories(rexcore PRIVATE
+     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
+ )
+ 
+-if(APPLE)
++if(ANDROID)
++    # Bionic has pthread and rt in libc.
++    target_link_libraries(rexcore PRIVATE dl log)
++elseif(APPLE)
+     target_link_libraries(rexcore PRIVATE pthread)
+ elseif(UNIX)
+     target_link_libraries(rexcore PRIVATE pthread rt dl)
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8b1c76a..ff8bff1 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -28,6 +28,11 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/platform.h>
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++#include <unistd.h>
++#include <cstdio>
++#endif
+ 
+ #include <ucontext.h>
+ 
+@@ -225,6 +230,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+         access_violation_operation = (mcontext_esr->esr & (UINT64_C(1) << 6))
+                                          ? Exception::AccessViolationOperation::kWrite
+                                          : Exception::AccessViolationOperation::kRead;
++      } else if ((mcontext_esr && ((mcontext_esr->esr >> 26) & 0b111110) == 0b100000) ||
++                 reinterpret_cast<uint64_t>(signal_info->si_addr) == mcontext.pc) {
++        // Instruction abort (a jump to an unmapped address, e.g. a null function pointer):
++        // there is no instruction to decode, and reading it here would fault again inside the
++        // handler, which the kernel answers by killing the process without any report.
++        access_violation_operation = Exception::AccessViolationOperation::kUnknown;
+       } else {
+         // Determine the memory access direction based on which instruction has
+         // requested it.
+@@ -417,6 +428,53 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       return;
+     }
+   }
++#if REX_PLATFORM_ANDROID && REX_ARCH_ARM64
++  // Under ART the restored handler is not debuggerd's, so no tombstone is written: report the
++  // fault (pc, lr and a frame-pointer walk as module+offset) on stderr first.
++  {
++    auto print_frame = [](const char* tag, uint64_t pc) {
++      Dl_info info{};
++      if (dladdr(reinterpret_cast<void*>(pc), &info) && info.dli_fname) {
++        fprintf(stderr, "  %s %016llx %s+0x%llx %s\n", tag, (unsigned long long)pc, info.dli_fname,
++                (unsigned long long)(pc - uint64_t(info.dli_fbase)), info.dli_sname ? info.dli_sname : "");
++      } else {
++        fprintf(stderr, "  %s %016llx ?\n", tag, (unsigned long long)pc);
++      }
++    };
++    fprintf(stderr, "unhandled signal %d at %p (thread %d)\n", signal_number, signal_info->si_addr,
++            int(gettid()));
++    print_frame("pc", thread_context.pc);
++    print_frame("lr", thread_context.x[30]);
++    uint64_t fp = thread_context.x[29];
++    for (int i = 0; i < 32 && fp && (fp & 7) == 0; i++) {
++      uint64_t next = reinterpret_cast<uint64_t*>(fp)[0];
++      uint64_t ret = reinterpret_cast<uint64_t*>(fp)[1];
++      if (!ret) break;
++      print_frame("fp", ret);
++      if (next <= fp) break;
++      fp = next;
++    }
++    fflush(stderr);
++  }
++#endif
++  // No handler claimed the fault: returning would re-run the faulting instruction forever (a
++  // silent spin, as seen in a Vulkan driver on Android). Put the previous handler back so the
++  // re-executed fault reaches it (the system crash reporter / debuggerd tombstone).
++  switch (signal_number) {
++    case SIGILL:
++      sigaction(SIGILL, &original_sigill_handler_, nullptr);
++      break;
++    case SIGSEGV:
++      sigaction(SIGSEGV, &original_sigsegv_handler_, nullptr);
++      break;
++#if REX_PLATFORM_MAC
++    case SIGBUS:
++      sigaction(SIGBUS, &original_sigbus_handler_, nullptr);
++      break;
++#endif
++    default:
++      break;
++  }
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 4fe1ca6..c5a4199 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -27,6 +27,89 @@ namespace rex::thread {
+ 
+ thread_local Fiber* Fiber::tls_current_ = nullptr;
+ 
++#if REX_PLATFORM_ANDROID
++// rex_fiber_switch(&from->sp_, to->sp_): push x19-x30 and d8-d15 (AAPCS64 callee-saved) on the
++// current stack, store sp, load the target's sp, pop its registers and return into it.
++// A new fiber's stack holds a frame whose x30 is rex_fiber_start and whose x19 is the entry.
++extern "C" void rex_fiber_switch(void** from_sp, void* to_sp);
++extern "C" void rex_fiber_start();
++asm(R"(
++  .text
++  .p2align 2
++  .globl rex_fiber_switch
++  .type rex_fiber_switch, %function
++rex_fiber_switch:
++  sub sp, sp, #160
++  stp x29, x30, [sp, #0]
++  stp x19, x20, [sp, #16]
++  stp x21, x22, [sp, #32]
++  stp x23, x24, [sp, #48]
++  stp x25, x26, [sp, #64]
++  stp x27, x28, [sp, #80]
++  stp d8, d9, [sp, #96]
++  stp d10, d11, [sp, #112]
++  stp d12, d13, [sp, #128]
++  stp d14, d15, [sp, #144]
++  mov x2, sp
++  str x2, [x0]
++  mov sp, x1
++  ldp x29, x30, [sp, #0]
++  ldp x19, x20, [sp, #16]
++  ldp x21, x22, [sp, #32]
++  ldp x23, x24, [sp, #48]
++  ldp x25, x26, [sp, #64]
++  ldp x27, x28, [sp, #80]
++  ldp d8, d9, [sp, #96]
++  ldp d10, d11, [sp, #112]
++  ldp d12, d13, [sp, #128]
++  ldp d14, d15, [sp, #144]
++  add sp, sp, #160
++  ret
++  .size rex_fiber_switch, . - rex_fiber_switch
++
++  .globl rex_fiber_start
++  .type rex_fiber_start, %function
++rex_fiber_start:
++  mov x29, #0
++  blr x19
++  brk #0
++  .size rex_fiber_start, . - rex_fiber_start
++)");
++
++Fiber* Fiber::ConvertCurrentThread() {
++  auto* f = new Fiber();
++  f->is_thread_fiber_ = true;
++  tls_current_ = f;
++  return f;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  auto* f = new Fiber();
++  f->entry_ = entry;
++  f->arg_ = arg;
++  f->stack_.resize(stack_size);
++  uintptr_t top = (reinterpret_cast<uintptr_t>(f->stack_.data()) + f->stack_.size()) & ~uintptr_t(15);
++  auto* frame = reinterpret_cast<uint64_t*>(top - 160);
++  for (int i = 0; i < 20; ++i) {
++    frame[i] = 0;
++  }
++  frame[1] = reinterpret_cast<uint64_t>(&rex_fiber_start);  // x30
++  frame[2] = reinterpret_cast<uint64_t>(&Fiber::Trampoline);  // x19
++  f->sp_ = frame;
++  return f;
++}
++
++/*static*/ void Fiber::Trampoline() {
++  Fiber* f = tls_current_;
++  f->entry_(f->arg_);
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  tls_current_ = target;
++  rex_fiber_switch(&from->sp_, target->sp_);
++}
++#else
+ Fiber* Fiber::ConvertCurrentThread() {
+   auto* f = new Fiber();
+   if (getcontext(&f->context_) == -1) {
+@@ -67,6 +150,7 @@ void Fiber::SwitchTo(Fiber* target) {
+   tls_current_ = target;
+   swapcontext(&from->context_, &target->context_);
+ }
++#endif  // REX_PLATFORM_ANDROID
+ 
+ void Fiber::Destroy() {
+   // Thread fibers are destroyed from the owning thread itself.
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index ef5bdf4..7a6cf2e 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -303,4 +303,21 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
+ }
+ 
+ }  // namespace filesystem
++#if REX_PLATFORM_ANDROID
++namespace filesystem {
++// Game data lives on app-specific storage as plain files; content:// URIs (Storage Access
++// Framework) would need JNI and are not used by the port.
++void AndroidInitialize() {}
++void AndroidShutdown() {}
++bool IsAndroidContentUri(const std::string_view source) {
++  return source.starts_with("content://");
++}
++int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode) {
++  (void)uri;
++  (void)mode;
++  return -1;
++}
++}  // namespace filesystem
++#endif  // REX_PLATFORM_ANDROID
++
+ }  // namespace rex
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..833df74 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -19,9 +19,13 @@
+ 
+ #include <fcntl.h>
+ 
++#include <rex/platform.h>
++
+ #if REX_PLATFORM_MAC
+ #include <mach/mach.h>
++#if !REX_PLATFORM_IOS
+ #include <mach/mach_vm.h>
++#endif
+ #include <mach/vm_region.h>
+ #endif  // REX_PLATFORM_MAC
+ 
+@@ -51,10 +55,7 @@
+ #include <dlfcn.h>
+ #include <sys/ioctl.h>
+ 
+-#include <linux/ashmem.h>
+-
+-// TODO(tomc): Android or maybe na. idk
+-// #include "xenia/base/main_android.h"
++#include <sys/mman.h>
+ #endif
+ 
+ namespace rex {
+@@ -84,32 +85,6 @@ static std::string MakeShmName(const std::filesystem::path& path) {
+   return name;
+ }
+ 
+-#if REX_PLATFORM_ANDROID
+-// May be null if no dynamically loaded functions are required.
+-static void* libandroid_;
+-// API 26+.
+-static int (*android_ASharedMemory_create_)(const char* name, size_t size);
+-
+-void AndroidInitialize() {
+-  if (rex::GetAndroidApiLevel() >= 26) {
+-    libandroid_ = dlopen("libandroid.so", RTLD_NOW);
+-    assert_not_null(libandroid_);
+-    if (libandroid_) {
+-      android_ASharedMemory_create_ = reinterpret_cast<decltype(android_ASharedMemory_create_)>(
+-          dlsym(libandroid_, "ASharedMemory_create"));
+-      assert_not_null(android_ASharedMemory_create_);
+-    }
+-  }
+-}
+-
+-void AndroidShutdown() {
+-  android_ASharedMemory_create_ = nullptr;
+-  if (libandroid_) {
+-    dlclose(libandroid_);
+-    libandroid_ = nullptr;
+-  }
+-}
+-#endif
+ 
+ size_t page_size() {
+   return getpagesize();
+@@ -278,9 +253,11 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+ 
+   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ #if REX_PLATFORM_MAC
++#if !REX_PLATFORM_IOS  // iOS refuses MAP_JIT without the JIT entitlement; nothing here executes.
+   if (access == PageAccess::kExecuteReadWrite || access == PageAccess::kExecuteReadOnly) {
+     flags |= MAP_JIT;
+   }
++#endif
+   if (base_address) {
+     flags |= MAP_FIXED;
+   }
+@@ -381,9 +358,20 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+   mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+   mach_port_t object_name;
+ 
++#if REX_PLATFORM_IOS
++  // mach_vm.h is unsupported in the iOS SDK; vm_region_64 is the same call with vm_* types.
++  vm_address_t vm_address = static_cast<vm_address_t>(address);
++  vm_size_t vm_size = 0;
++  kern_return_t kr =
++      vm_region_64(mach_task_self(), &vm_address, &vm_size, VM_REGION_BASIC_INFO_64,
++                   reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
++  address = vm_address;
++  region_size = vm_size;
++#else
+   kern_return_t kr =
+       mach_vm_region(mach_task_self(), &address, &region_size, VM_REGION_BASIC_INFO_64,
+                      reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
++#endif
+   if (kr != KERN_SUCCESS) {
+     return false;
+   }
+@@ -432,28 +420,39 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
+                                           PageAccess access, bool commit) {
+ #if REX_PLATFORM_ANDROID
+-  // TODO(Triang3l): Check if memfd can be used instead on API 30+.
+-  if (android_ASharedMemory_create_) {
+-    int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
+-    return sharedmem_fd >= 0 ? static_cast<FileMappingHandle>(sharedmem_fd)
+-                             : kFileMappingHandleInvalid;
+-  }
+-
+-  // Use /dev/ashmem on API versions below 26, which added ASharedMemory.
+-  // /dev/ashmem was disabled on API 29 for apps targeting it.
+-  // https://chromium.googlesource.com/chromium/src/+/master/third_party/ashmem/ashmem-dev.c
+-  int ashmem_fd = open("/" ASHMEM_NAME_DEF, O_RDWR);
+-  if (ashmem_fd < 0) {
++  // memfd (API 30+, the minimum this port targets): anonymous, sparse until written, like the
++  // /dev/shm file on Linux. Grows with ftruncate; nothing to unlink.
++  (void)access;
++  (void)commit;
++  int fd = memfd_create(path.filename().c_str(), MFD_CLOEXEC);
++  if (fd < 0) {
+     return kFileMappingHandleInvalid;
+   }
+-  char ashmem_name[ASHMEM_NAME_LEN];
+-  strlcpy(ashmem_name, path.c_str(), rex::countof(ashmem_name));
+-  if (ioctl(ashmem_fd, ASHMEM_SET_NAME, ashmem_name) < 0 ||
+-      ioctl(ashmem_fd, ASHMEM_SET_SIZE, length) < 0) {
+-    close(ashmem_fd);
++  if (ftruncate64(fd, static_cast<off64_t>(length)) != 0) {
++    close(fd);
+     return kFileMappingHandleInvalid;
+   }
+-  return static_cast<FileMappingHandle>(ashmem_fd);
++  return static_cast<FileMappingHandle>(fd);
++#elif REX_PLATFORM_IOS
++  // The iOS sandbox denies shm_open: back the guest memory with a sparse file in the app's tmp
++  // directory instead, unlinked at once (the fd keeps it alive; a crash leaves nothing behind).
++  // The views alias it with MAP_SHARED exactly as they would a shm object.
++  (void)access;
++  (void)commit;
++  const char* tmp_dir = std::getenv("TMPDIR");
++  std::filesystem::path backing = std::filesystem::path(tmp_dir ? tmp_dir : "/tmp") / path.filename();
++  int fd = open(backing.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
++  if (fd < 0) {
++    REXSYS_ERROR("guest memory backing file {} failed: {}", backing.string(), strerror(errno));
++    return kFileMappingHandleInvalid;
++  }
++  unlink(backing.c_str());
++  if (ftruncate(fd, static_cast<off_t>(length)) != 0) {
++    REXSYS_ERROR("guest memory backing file truncate to 0x{:X} failed: {}", length, strerror(errno));
++    close(fd);
++    return kFileMappingHandleInvalid;
++  }
++  return static_cast<FileMappingHandle>(fd);
+ #else
+   int oflag;
+   switch (access) {
+@@ -483,13 +482,17 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+     shm_unlink(full_path.c_str());
+     return kFileMappingHandleInvalid;
+   }
++  // Nothing opens the object by name again: unlink it now, so its memory goes with the last fd and
++  // mapping. Unlinked only at a clean shutdown, every killed or crashed run left its guest memory
++  // behind until reboot (it filled 30 GB of swap on an 8 GB Mac).
++  shm_unlink(full_path.c_str());
+   return static_cast<FileMappingHandle>(ret);
+ #endif
+ }
+ 
+ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+   close(static_cast<int>(handle));
+-#if !REX_PLATFORM_ANDROID
++#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_IOS
+   auto full_path = MakeShmName(path);
+   shm_unlink(full_path.c_str());
+ #endif
+diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
+index 5e0a932..cd75b74 100644
+--- a/src/core/seh_posix.cpp
++++ b/src/core/seh_posix.cpp
+@@ -13,12 +13,71 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ #include <signal.h>
+ #include <cstdlib>  // std::abort()
++#if defined(__ANDROID__)
++#include <dlfcn.h>
++#include <ucontext.h>
++#include <unistd.h>
++#include <cstdio>
++#endif
+ 
+ #include <rex/platform/exceptions.h>
+ 
+ namespace rex::platform {
+ 
+ static thread_local SehThreadState tls_seh_state;
++
++// Handlers installed before seh_initialize (the runtime's guest-memory exception handler, ART's
++// signal chain and debuggerd on Android): faults outside SEH regions go to them.
++static struct sigaction g_previous[NSIG];
++
++static void ChainToPrevious(int sig, siginfo_t* info, void* ucontext) {
++  const struct sigaction& prev = g_previous[sig];
++  if (prev.sa_flags & SA_SIGINFO) {
++    if (prev.sa_sigaction) {
++      prev.sa_sigaction(sig, info, ucontext);
++      return;
++    }
++  } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN && prev.sa_handler) {
++    prev.sa_handler(sig);
++    return;
++  }
++#if defined(__ANDROID__) && defined(__aarch64__)
++  // Under ART the default action dies without a tombstone: report the fault on stderr first.
++  {
++    const mcontext_t& mc = static_cast<ucontext_t*>(ucontext)->uc_mcontext;
++    auto frame = [](const char* tag, uint64_t pc) {
++      Dl_info dl{};
++      if (dladdr(reinterpret_cast<void*>(pc), &dl) && dl.dli_fname) {
++        fprintf(stderr, "  %s %016llx %s+0x%llx %s\n", tag, (unsigned long long)pc, dl.dli_fname,
++                (unsigned long long)(pc - uint64_t(dl.dli_fbase)), dl.dli_sname ? dl.dli_sname : "");
++      } else {
++        fprintf(stderr, "  %s %016llx ?\n", tag, (unsigned long long)pc);
++      }
++    };
++    fprintf(stderr, "fatal signal %d, fault address %p, thread %d\n", sig, info ? info->si_addr : nullptr,
++            int(gettid()));
++    frame("pc", mc.pc);
++    frame("lr", mc.regs[30]);
++    for (int r = 0; r < 31; r += 4) {
++      fprintf(stderr, "  x%d %016llx %016llx %016llx %016llx\n", r, (unsigned long long)mc.regs[r],
++              (unsigned long long)mc.regs[r + 1], (unsigned long long)mc.regs[r + 2],
++              r + 3 < 31 ? (unsigned long long)mc.regs[r + 3] : 0ull);
++    }
++    uint64_t fp = mc.regs[29];
++    for (int i = 0; i < 40 && fp && (fp & 7) == 0; i++) {
++      uint64_t next = reinterpret_cast<uint64_t*>(fp)[0];
++      uint64_t ret = reinterpret_cast<uint64_t*>(fp)[1];
++      if (!ret) break;
++      frame("fp", ret);
++      if (next <= fp) break;
++      fp = next;
++    }
++    fflush(stderr);
++  }
++#endif
++  signal(sig, SIG_DFL);
++  raise(sig);
++}
+ static thread_local bool tls_seh_active = false;
+ 
+ SehThreadState& seh_thread_state() {
+@@ -31,12 +90,13 @@ int seh_filter(uint32_t /*code*/, void* /*ep*/) {
+ }
+ 
+ /// Signal handler for SIGSEGV/SIGBUS/SIGFPE/SIGILL
+-static void signal_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
++static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
+   // Only handle if we're in SEH-protected code
+   if (!tls_seh_active) {
+-    // Not in SEH region - restore default handler and re-raise
+-    signal(sig, SIG_DFL);
+-    raise(sig);
++    // Not in an SEH region: the previous handler decides (it may be a guest-memory access the
++    // runtime resolves). Resetting to SIG_DFL here killed the process silently, with no crash
++    // report, and bypassed the runtime's own handler.
++    ChainToPrevious(sig, info, ucontext);
+     return;
+   }
+ 
+@@ -110,10 +170,10 @@ void seh_initialize() {
+   sigemptyset(&sa.sa_mask);
+   sa.sa_flags = SA_SIGINFO | SA_NODEFER;  // SA_NODEFER allows re-entry for nested exceptions
+ 
+-  sigaction(SIGSEGV, &sa, nullptr);
+-  sigaction(SIGBUS, &sa, nullptr);
+-  sigaction(SIGFPE, &sa, nullptr);
+-  sigaction(SIGILL, &sa, nullptr);
++  sigaction(SIGSEGV, &sa, &g_previous[SIGSEGV]);
++  sigaction(SIGBUS, &sa, &g_previous[SIGBUS]);
++  sigaction(SIGFPE, &sa, &g_previous[SIGFPE]);
++  sigaction(SIGILL, &sa, &g_previous[SIGILL]);
+ }
+ 
+ bool& seh_active() {
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..4f692bc 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -41,15 +41,18 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <rex/thread/timer_queue.h>
+ 
+ #include <sched.h>
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++#endif
++#include <string>
+ 
+ #if REX_PLATFORM_ANDROID
+-#include <dlfcn.h>
+-
+-#include <rex/main_android.h>
+ #include <rex/string.h>
+ #endif
+ 
+ #if REX_PLATFORM_LINUX
++#include <linux/futex.h>
++#include <sys/syscall.h>
+ // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
+ #define REX_HAS_SIGEV_THREAD_ID 1
+ #ifdef __GLIBC__
+@@ -65,30 +68,14 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ namespace rex::thread {
+ 
+ #if REX_PLATFORM_ANDROID
+-// May be null if no dynamically loaded functions are required.
+-static void* android_libc_;
+-// API 26+.
+-static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf, size_t n);
++// The port targets API 30+, where Bionic has pthread_getname_np (API 26+), so the pre-26 name
++// fallback below is never taken.
++static int (*android_pthread_getname_np_)(pthread_t pthread, char* buf,
++                                          size_t n) = pthread_getname_np;
+ 
+-void AndroidInitialize() {
+-  if (rex::GetAndroidApiLevel() >= 26) {
+-    android_libc_ = dlopen("libc.so", RTLD_NOW);
+-    assert_not_null(android_libc_);
+-    if (android_libc_) {
+-      android_pthread_getname_np_ = reinterpret_cast<decltype(android_pthread_getname_np_)>(
+-          dlsym(android_libc_, "pthread_getname_np"));
+-      assert_not_null(android_pthread_getname_np_);
+-    }
+-  }
+-}
++void AndroidInitialize() {}
+ 
+-void AndroidShutdown() {
+-  android_pthread_getname_np_ = nullptr;
+-  if (android_libc_) {
+-    dlclose(android_libc_);
+-    android_libc_ = nullptr;
+-  }
+-}
++void AndroidShutdown() {}
+ #endif
+ 
+ template <typename _Rep, typename _Period>
+@@ -267,10 +254,35 @@ static sem_t* RexCreateAnonymousSemaphore() {
+ }
+ #endif  // __APPLE__
+ 
++// Waits on several handles had no way to sleep until one of them changes, so they polled with
++// 1 ms sleeps: a guest thread waiting for any of a few events woke up to ~1 ms late, every time
++// (GTA V's game threads do this every frame). Every signal now bumps this word and wakes the
++// multi-waiters through a futex; they recheck at once. The 1 ms poll stays as the upper bound,
++// so a signal path that does not notify is never worse than before.
++#if REX_PLATFORM_LINUX
++static std::atomic<uint32_t> multi_wait_epoch_{0};
++static std::atomic<int32_t> multi_waiters_{0};
++static inline void NotifyAllMultiWaiters() {
++  multi_wait_epoch_.fetch_add(1, std::memory_order_seq_cst);
++  if (multi_waiters_.load(std::memory_order_seq_cst) > 0)
++    syscall(SYS_futex, &multi_wait_epoch_, FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0);
++}
++#else
++static inline void NotifyAllMultiWaiters() {}
++#endif
++
+ class PosixConditionBase {
+  public:
++  // Threads inside WaitMultiple on this handle: a signal wakes the multi-waiters only then (one
++  // futex wake per signal of any handle was ~10,000 syscalls a second on GTA V's update thread).
++  std::atomic<int32_t> multi_waiters_here_{0};
++  void NotifyMultiWaiters() {
++    std::atomic_thread_fence(std::memory_order_seq_cst);  // the state change before the count
++    if (multi_waiters_here_.load(std::memory_order_seq_cst) > 0) NotifyAllMultiWaiters();
++  }
++
+   PosixConditionBase() {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
+     // Use robust mutexes so waits can recover if owner thread terminates.
+     pthread_mutexattr_t attr;
+     if (pthread_mutexattr_init(&attr) == 0) {
+@@ -290,7 +302,7 @@ class PosixConditionBase {
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+     auto predicate = [this] { return this->signaled(); };
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     int lock_result = pthread_mutex_lock(native_mutex);
+     if (lock_result == EOWNERDEAD) {
+@@ -330,12 +342,28 @@ class PosixConditionBase {
+       return std::make_pair(result, 0);
+     }
+ 
++#if REX_PLATFORM_LINUX
++    // Registered before the handles are checked: a signal from then on bumps the epoch.
++    struct Registration {
++      std::vector<PosixConditionBase*>& handles;
++      explicit Registration(std::vector<PosixConditionBase*>& h) : handles(h) {
++        for (auto* handle : handles) handle->multi_waiters_here_.fetch_add(1, std::memory_order_seq_cst);
++      }
++      ~Registration() {
++        for (auto* handle : handles) handle->multi_waiters_here_.fetch_sub(1, std::memory_order_seq_cst);
++      }
++    } registration(handles);
++#endif
+     auto start_time = std::chrono::steady_clock::now();
+     auto end_time = (timeout == std::chrono::milliseconds::max())
+                         ? std::chrono::steady_clock::time_point::max()
+                         : start_time + timeout;
+ 
+     while (true) {
++#if REX_PLATFORM_LINUX
++      // Read before the handles are checked: a signal after the check changes it.
++      uint32_t seen_epoch = multi_wait_epoch_.load(std::memory_order_seq_cst);
++#endif
+       size_t first_signaled = std::numeric_limits<size_t>::max();
+       bool condition_met = false;
+       bool all_locked = true;
+@@ -344,7 +372,7 @@ class PosixConditionBase {
+       locks.reserve(handles.size());
+ 
+       for (size_t i = 0; i < handles.size(); ++i) {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID  // Bionic: no robust mutexes
+         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+         int result = pthread_mutex_trylock(native_mutex);
+         if (result == 0 || result == EOWNERDEAD) {
+@@ -411,6 +439,19 @@ class PosixConditionBase {
+         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
+       }
+ 
++#if REX_PLATFORM_LINUX
++      {
++        auto remaining = end_time - now;
++        auto wait = timeout == std::chrono::milliseconds::max()
++                        ? std::chrono::nanoseconds(std::chrono::milliseconds(1))
++                        : std::min<std::chrono::nanoseconds>(remaining, std::chrono::milliseconds(1));
++        timespec ts{0, long(wait.count())};
++        multi_waiters_.fetch_add(1, std::memory_order_seq_cst);
++        if (multi_wait_epoch_.load(std::memory_order_seq_cst) == seen_epoch)
++          syscall(SYS_futex, &multi_wait_epoch_, FUTEX_WAIT_PRIVATE, seen_epoch, &ts, nullptr, 0);
++        multi_waiters_.fetch_sub(1, std::memory_order_seq_cst);
++      }
++#else
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+@@ -418,6 +459,7 @@ class PosixConditionBase {
+         auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+         std::this_thread::sleep_for(sleep_time);
+       }
++#endif
+     }
+   }
+ 
+@@ -450,6 +492,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     signal_ = true;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -487,6 +530,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+     }
+     count_ += release_count;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -519,6 +563,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+       // Free to be acquired by another thread
+       if (count_ == 0) {
+         cond_.notify_all();
++        NotifyMultiWaiters();
+       }
+       return true;
+     }
+@@ -551,6 +596,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+     std::lock_guard<std::mutex> lock(mutex_);
+     signal_ = true;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -979,6 +1025,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       exit_code_ = exit_code;
+       signaled_ = true;
+       cond_.notify_all();
++      NotifyMultiWaiters();
+     }
+     if (is_current_thread) {
+       pthread_exit(reinterpret_cast<void*>(exit_code));
+@@ -1405,6 +1452,30 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+   }
+ #endif
+   set_current_thread_name("");
++#if defined(__APPLE__)
++  // Without a QoS class the scheduler may run guest threads on the efficiency cores (a process
++  // started from a shell in the background has no app to inherit one from). REX_THREAD_QOS=0: off.
++  {
++    static const bool qos = !getenv("REX_THREAD_QOS") || std::string(getenv("REX_THREAD_QOS")) != "0";
++    if (qos) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++  }
++#endif
++#if REX_PLATFORM_ANDROID
++  // Same problem on phones (big.LITTLE): the scheduler kept the title's threads on the little
++  // cores, about 3x slower for recompiled code. Keep them on the upper half of the CPU numbers
++  // (the mid and prime clusters). Opt in with REX_THREAD_BIG_CORES=1: with ~20 title threads on
++  // four cores the renderer competed for them (not yet measured on a cool phone).
++  {
++    static const bool big = getenv("REX_THREAD_BIG_CORES") && std::string(getenv("REX_THREAD_BIG_CORES")) == "1";
++    int n = int(sysconf(_SC_NPROCESSORS_CONF));
++    if (big && n >= 4) {
++      cpu_set_t set;
++      CPU_ZERO(&set);
++      for (int i = n / 2; i < n; i++) CPU_SET(i, &set);
++      sched_setaffinity(0, sizeof(set), &set);
++    }
++  }
++#endif
+ 
+   auto start_data = static_cast<ThreadStartData*>(parameter);
+   assert_not_null(start_data);
+@@ -1449,6 +1520,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+     thread->handle_.exit_code_ = 0;
+     thread->handle_.signaled_ = true;
+     thread->handle_.cond_.notify_all();
++    thread->handle_.NotifyMultiWaiters();
+   }
+ 
+   current_thread_ = nullptr;
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..6ca9d62 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -15,7 +15,7 @@
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+ #include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
++#include <disruptorplus/blocking_wait_strategy.hpp>
+ 
+ #include <rex/assert.h>
+ #include <rex/thread.h>
+@@ -69,7 +69,8 @@ class TimerQueue {
+         // Consume new wait items and add them to sorted wait queue
+         dp::sequence_t available = claim_strategy_.wait_until_published(
+             next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++            // (not time_point::max(): a condition variable's timed wait can overflow on it)
++            wait_queue_.empty() ? clock::now() + std::chrono::seconds(1) : wait_queue_.front()->due_);
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
+@@ -142,9 +143,11 @@ class TimerQueue {
+   // This ring buffer will be used to introduce timers queued by the public API
+   static constexpr size_t kWaitCount = 512;
+   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  // Blocking, not spin: the spin strategy yielded in a loop while idle (~30% of a core on an M1,
++  // plus a sysctl per spin_wait for hardware_concurrency).
++  dp::blocking_wait_strategy wait_strategy_;
++  dp::multi_threaded_claim_strategy<dp::blocking_wait_strategy> claim_strategy_;
++  dp::sequence_barrier<dp::blocking_wait_strategy> consumed_;
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..7b670a6 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,11 +10,21 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cinttypes>
++#include <mutex>
++#include <deque>
++#include <vector>
+ #include <cmath>
+ #include <cstring>
+ #include <string_view>
+ 
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
+ #include <fmt/format.h>
+ 
+ #include <rex/cvar.h>
+@@ -80,6 +90,64 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// gtav native renderer: when the title executable exports rex_skip_rendering_fence, it is called
++// before every EVENT_WRITE_SHD (the GPU fence writes the game waits on before reusing memory) and
++// returns the value to write: the title's renderer may hold a fence back (the real GPU runs well
++// behind the CPU) and copy data it has not read yet. Address is guest physical. While the command
++// processor has been idle for 2 ms, rex_skip_rendering_idle lets it release what it held back
++// (the game is probably waiting for it).
++using SkipRenderingFenceHook = uint32_t (*)(uint32_t address, uint32_t value, uint32_t endian);
++using SkipRenderingIdleHook = void (*)();
++static SkipRenderingIdleHook ResolveSkipRenderingIdleHook() {
++#ifdef _WIN32
++  return reinterpret_cast<SkipRenderingIdleHook>(GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_idle"));
++#else
++  return reinterpret_cast<SkipRenderingIdleHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_idle"));
++#endif
++}
++static SkipRenderingFenceHook ResolveSkipRenderingFenceHook() {
++#ifdef _WIN32
++  return reinterpret_cast<SkipRenderingFenceHook>(
++      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_fence"));
++#else
++  return reinterpret_cast<SkipRenderingFenceHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_fence"));
++#endif
++}
++
++// Number of guest threads blocked on a GPU fence right now (the title's D3D fence-wait hook), or
++// null. While a thread waits, the lag below only delays the game: kicks are let through one by
++// one until it is released.
++using SkipRenderingGpuWaitersHook = int (*)();
++static SkipRenderingGpuWaitersHook ResolveSkipRenderingGpuWaitersHook() {
++#ifdef _WIN32
++  return reinterpret_cast<SkipRenderingGpuWaitersHook>(
++      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_gpu_waiters"));
++#else
++  return reinterpret_cast<SkipRenderingGpuWaitersHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_gpu_waiters"));
++#endif
++}
++
++// gtav native renderer (gpu_skip_rendering): this command processor runs right behind the CPU,
++// while the real GPU trails it by up to a frame. The game fills some vertex buffers after the
++// kick that carries their draw and recycles memory once the GPU's fences, counters and read
++// pointer have passed it, so running right behind the CPU tells it too early. With
++// --gpu_skip_rendering_lag_ms the command processor only executes up to write pointers the CPU
++// set at least that long ago (a game waiting on the GPU waits at most that long).
++REXCVAR_DECLARE(bool, gpu_skip_rendering);  // defined by the backend's command processor
++#if defined(__ANDROID__)
++#define GPU_IDLE_SPINS_DEFAULT 8
++#else
++#define GPU_IDLE_SPINS_DEFAULT 500
++#endif
++REXCVAR_DEFINE_INT32(gpu_idle_spins, GPU_IDLE_SPINS_DEFAULT, "GPU",
++                     "Command processor: sched_yield spins while idle before sleeping on the write pointer (each "
++                     "spin also reads the clock; with gpu_skip_rendering_lag_ms the idle comes back every kick, "
++                     "~70% of a core on a phone at 500)");
++REXCVAR_DEFINE_INT32(gpu_skip_rendering_lag_ms, 0, "GPU",
++                     "Command processor latency behind the CPU's kicks (title-side renderer)");
++static std::mutex g_kick_mutex;
++static std::deque<std::pair<uint32_t, std::chrono::steady_clock::time_point>> g_kicks;
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+@@ -101,6 +169,17 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+ 
+ }  // namespace
+ 
++// The running command processor's write-pointer event: rex_skip_rendering_wake (called by a
++// title-side renderer when a game thread starts waiting on the GPU) cuts its idle sleep short.
++static std::atomic<rex::thread::Event*> g_wake_event{nullptr};
++#if defined(_WIN32)
++extern "C" __declspec(dllexport) void rex_skip_rendering_wake() {
++#else
++extern "C" __attribute__((visibility("default"))) void rex_skip_rendering_wake() {
++#endif
++  if (auto* event = g_wake_event.load(std::memory_order_acquire)) event->Set();
++}
++
+ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
+                                    system::KernelState* kernel_state)
+     : memory_(graphics_system->memory()),
+@@ -111,9 +190,13 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
+       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
+       write_ptr_index_(0) {
+   assert_not_null(write_ptr_index_event_);
++  g_wake_event.store(write_ptr_index_event_.get(), std::memory_order_release);
+ }
+ 
+-CommandProcessor::~CommandProcessor() = default;
++CommandProcessor::~CommandProcessor() {
++  rex::thread::Event* expected = write_ptr_index_event_.get();
++  g_wake_event.compare_exchange_strong(expected, nullptr);
++}
+ 
+ bool CommandProcessor::Initialize() {
+   // Initialize the gamma ramps to their default (linear) values - taken from
+@@ -210,7 +293,25 @@ void CommandProcessor::WorkerThreadMain() {
+       fn();
+     }
+ 
+-    uint32_t write_ptr_index = write_ptr_index_.load();
++    // --gpu_skip_rendering_lag_ms: the newest write pointer that is old enough.
++    auto lagged_write_ptr = [this]() -> uint32_t {
++      int32_t lag = REXCVAR_GET(gpu_skip_rendering_lag_ms);
++      if (lag <= 0) return write_ptr_index_.load();
++      static const SkipRenderingGpuWaitersHook gpu_waiters = ResolveSkipRenderingGpuWaitersHook();
++      std::lock_guard lock(g_kick_mutex);
++      auto ready = std::chrono::steady_clock::now() - std::chrono::milliseconds(lag);
++      while (!g_kicks.empty() && g_kicks.front().second <= ready) {
++        lagged_ptr_ = g_kicks.front().first;
++        g_kicks.pop_front();
++      }
++      // The game is blocked on a fence: the next kick now (one per pass, up to that fence).
++      if (!g_kicks.empty() && read_ptr_index_ == lagged_ptr_ && gpu_waiters && gpu_waiters() > 0) {
++        lagged_ptr_ = g_kicks.front().first;
++        g_kicks.pop_front();
++      }
++      return lagged_ptr_;
++    };
++    uint32_t write_ptr_index = lagged_write_ptr();
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+       // We've run out of commands to execute.
+@@ -218,17 +319,26 @@ void CommandProcessor::WorkerThreadMain() {
+       // event is too high.
+       PrepareForWait();
+       uint32_t loop_count = 0;
++      static const SkipRenderingIdleHook idle_hook = ResolveSkipRenderingIdleHook();
++      auto idle_start = std::chrono::steady_clock::now();
++      bool idle_reported = false;
+       do {
++        if (idle_hook && !idle_reported &&
++            std::chrono::steady_clock::now() - idle_start >= std::chrono::milliseconds(2)) {
++          idle_hook();
++          idle_reported = true;
++        }
+         // If we spin around too much, revert to a "low-power" state.
+-        if (loop_count > 500) {
+-          const int wait_time_ms = 5;
++        if (loop_count > uint32_t(std::max(REXCVAR_GET(gpu_idle_spins), 0))) {
++          const int wait_time_ms =
++              (idle_hook && !idle_reported) || REXCVAR_GET(gpu_skip_rendering_lag_ms) > 0 ? 1 : 5;
+           rex::thread::Wait(write_ptr_index_event_.get(), true,
+                             std::chrono::milliseconds(wait_time_ms));
+         }
+ 
+         rex::thread::MaybeYield();
+         loop_count++;
+-        write_ptr_index = write_ptr_index_.load();
++        write_ptr_index = lagged_write_ptr();
+       } while (worker_running_ && pending_fns_.empty() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
+@@ -313,6 +423,11 @@ void CommandProcessor::ShutdownContext() {}
+ 
+ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+   read_ptr_index_ = 0;
++  lagged_ptr_ = 0;
++  {
++    std::lock_guard lock(g_kick_mutex);
++    g_kicks.clear();
++  }
+   primary_buffer_ptr_ = ptr;
+   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+ }
+@@ -328,6 +443,10 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+ }
+ 
+ void CommandProcessor::UpdateWritePointer(uint32_t value) {
++  if (REXCVAR_GET(gpu_skip_rendering_lag_ms) > 0) {
++    std::lock_guard lock(g_kick_mutex);
++    g_kicks.emplace_back(value, std::chrono::steady_clock::now());
++  }
+   write_ptr_index_ = value;
+   write_ptr_index_event_->Set();
+ }
+@@ -355,7 +474,15 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+-  if (!regs.GetRegisterInfo(index)) {
++  // GetRegisterInfo is a switch over every register with a function-local static per case: once
++  // per register write it was a quarter of the command processor's time. Known registers are
++  // looked up once instead.
++  static const std::vector<bool> known_registers = [&regs] {
++    std::vector<bool> known(RegisterFile::kRegisterCount);
++    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) known[i] = regs.GetRegisterInfo(i) != nullptr;
++    return known;
++  }();
++  if (!known_registers[index]) {
+     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+   }
+ 
+@@ -702,6 +829,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+ 
+   uint32_t base_index = (packet & 0x7FFF);
+   uint32_t write_one_reg = (packet >> 15) & 0x1;
++  if (!write_one_reg) {
++    // Consecutive registers (shader constants mostly, ~a million a frame): one range write, which
++    // the backends turn into a byte-swapping copy for the constant ranges.
++    WriteRegisterRangeFromRing(reader, base_index, count);
++    return true;
++  }
+   for (uint32_t m = 0; m < count; m++) {
+     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+@@ -1213,6 +1346,8 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+   }
+   auto endianness = static_cast<xenos::Endian>(address & 0x3);
+   address &= ~0x3;
++  static const SkipRenderingFenceHook fence_hook = ResolveSkipRenderingFenceHook();
++  if (fence_hook) data_value = fence_hook(address, data_value, uint32_t(endianness));
+   data_value = GpuSwap(data_value, endianness);
+   memory::store(memory_->TranslatePhysical(address), data_value);
+   return true;
+@@ -1524,6 +1659,9 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
+   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
+   assert_true(start == 0);
+ 
++  // --gpu_skip_rendering: nothing draws with the shader (a title-side renderer does), and
++  // hashing + looking up every loaded shader was ~7% of the command processor.
++  if (REXCVAR_GET(gpu_skip_rendering)) return true;
+   auto shader =
+       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+   switch (shader_type) {
+@@ -1554,6 +1692,10 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer*
+   assert_true(start == 0);
+   assert_true(reader->read_count() >= size_dwords * 4);
+   assert_true(count - 2 >= size_dwords);
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    reader->AdvanceRead(size_dwords * sizeof(uint32_t));
++    return true;
++  }
+   auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
+                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
+   switch (shader_type) {
+@@ -1594,11 +1736,11 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader,
+     // On hardware this clears the internal state of the scan converter (which
+     // is different to the register)
+     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
+-    REXGPU_INFO("Begin viz query ID {:02X}", id);
++    REXGPU_DEBUG("Begin viz query ID {:02X}", id);
+   } else {
+     // end the viz query
+     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_END);
+-    REXGPU_INFO("End viz query ID {:02X}", id);
++    REXGPU_DEBUG("End viz query ID {:02X}", id);
+     // The scan converter writes the internal result back to the register here.
+     // We just fake it and say it was visible in case it is read back.
+     if (id < 32) {
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..1c2dada 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cstdarg>
+ #include <cstring>
++#include <filesystem>
+ #include <sstream>
+ #include <utility>
+ 
+@@ -32,6 +33,19 @@
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++// A title-side renderer draws the frames: the command processor still executes the PM4 stream
++// (registers, fences, interrupts, swaps) but issues no host draws, resolves or presents, and
++// occlusion queries take the base class's fake-sample path. (Same flag as the Vulkan backend;
++// the two backends are never compiled into one plugin here.)
++// gtav native-renderer bring-up (same as the Vulkan backend): every resolve of the chosen frame is
++// written to logs/emu_dump/frame_N/<seq>_<address>.bin (needs d3d12_readback_resolve=full) plus the
++// draw constants of emu_draw_dump_window frames. -1 = the next frame (set by the game on F9).
++REXCVAR_DEFINE_INT32(emu_resolve_dump_frame, 0, "GPU",
++                     "Dump every resolve of this frame to logs/emu_dump (-1 = next frame)");
++REXCVAR_DEFINE_INT32(emu_draw_dump_window, 1, "GPU",
++                     "Number of frames (from emu_resolve_dump_frame) whose draw constants are dumped");
++REXCVAR_DEFINE_BOOL(gpu_skip_rendering, false, "GPU",
++                    "Execute PM4 without rendering (a title-side renderer draws the frames)");
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+@@ -47,6 +61,18 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// gtav native renderer: with gpu_skip_rendering the title's renderer replays frames some time
++// after this command processor executed them, yet fences written after a swap tell the game the
++// GPU is done with that frame's memory (it then streams new textures and vertex data into it).
++// When the title executable exports rex_skip_rendering_swap, this plugin calls it on the command
++// processor thread at every swap (0-based, in PM4 order); it blocks until the title's renderer
++// has read the frame's guest memory.
++using SkipRenderingSwapHook = void (*)(uint64_t swap_index);
++static SkipRenderingSwapHook ResolveSkipRenderingSwapHook() {
++  return reinterpret_cast<SkipRenderingSwapHook>(
++      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_swap"));
++}
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -152,7 +178,8 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
+ 
+ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
+                                                                uint32_t packet, uint32_t count) {
+-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
++  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
++      REXCVAR_GET(gpu_skip_rendering)) {
+     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+   }
+ 
+@@ -1897,7 +1924,13 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+-  if (!graphics_system_)
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    static uint64_t skip_swaps = 0;
++    static const SkipRenderingSwapHook hook = ResolveSkipRenderingSwapHook();
++    if (hook) hook(skip_swaps);
++    skip_swaps++;
++  }
++  if (!graphics_system_ || REXCVAR_GET(gpu_skip_rendering))
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
+   if (!presenter) {
+@@ -2275,6 +2308,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    return true;
++  }
++  DumpDrawConstantsForComparison(uint32_t(primitive_type), index_count);
+   ID3D12Device* device = GetD3D12Provider().GetDevice();
+   const RegisterFile& regs = *register_file_;
+ 
+@@ -2870,10 +2907,72 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+   return true;
+ }
+ 
++bool D3D12CommandProcessor::EmuDumpActive() {
++  int32_t frame = REXCVAR_GET(emu_resolve_dump_frame);
++  if (frame < 0) {
++    REXCVAR_SET(emu_resolve_dump_frame, 0);
++    emu_dump_target_ = frame_current_ + 1;
++  } else if (frame > 0) {
++    emu_dump_target_ = uint64_t(frame);
++  }
++  uint64_t window = uint64_t(std::max(1, REXCVAR_GET(emu_draw_dump_window)));
++  return emu_dump_target_ && frame_current_ >= emu_dump_target_ && frame_current_ < emu_dump_target_ + window;
++}
++
++void D3D12CommandProcessor::DumpResolveForComparison(uint32_t address, uint32_t length,
++                                                     const uint8_t* data) {
++  if (!EmuDumpActive()) return;
++  if (emu_dump_frame_ != frame_current_) {
++    emu_dump_frame_ = frame_current_;
++    emu_dump_sequence_ = 0;
++  }
++  std::filesystem::path dir = std::filesystem::path("logs/emu_dump") / fmt::format("frame_{}", frame_current_);
++  std::error_code ec;
++  std::filesystem::create_directories(dir, ec);
++  auto path = dir / fmt::format("{:03}_{:08X}.bin", emu_dump_sequence_++, address);
++  if (FILE* f = std::fopen(path.string().c_str(), "wb")) {
++    std::fwrite(data, 1, length, f);
++    std::fclose(f);
++  }
++}
++
++void D3D12CommandProcessor::FlushDrawConstantsForComparison() {
++  if (emu_draw_constants_.empty()) return;
++  std::filesystem::path dir =
++      std::filesystem::path("logs/emu_dump") / fmt::format("frame_{}", emu_draw_constants_frame_);
++  std::error_code ec;
++  std::filesystem::create_directories(dir, ec);
++  if (FILE* f = std::fopen((dir / "draws.bin").string().c_str(), "ab")) {
++    std::fwrite(emu_draw_constants_.data(), 1, emu_draw_constants_.size(), f);
++    std::fclose(f);
++  }
++  emu_draw_constants_.clear();
++}
++
++void D3D12CommandProcessor::DumpDrawConstantsForComparison(uint32_t prim, uint32_t count) {
++  bool active = EmuDumpActive();
++  if (!emu_draw_constants_.empty() && (!active || emu_draw_constants_frame_ != frame_current_))
++    FlushDrawConstantsForComparison();
++  if (!active) return;
++  emu_draw_constants_frame_ = frame_current_;
++  auto* ps = active_pixel_shader();
++  uint64_t hash = ps ? ps->ucode_data_hash() : 0;
++  uint32_t header[4] = {prim, count, uint32_t(hash), uint32_t(hash >> 32)};
++  auto append = [&](const void* p, size_t n) {
++    auto* b = static_cast<const uint8_t*>(p);
++    emu_draw_constants_.insert(emu_draw_constants_.end(), b, b + n);
++  };
++  append(header, sizeof(header));
++  append(&register_file_->values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4 * 2048);
++}
++
+ bool D3D12CommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    return true;
++  }
+   if (!BeginSubmission(true)) {
+     return false;
+   }
+@@ -3095,6 +3194,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+     uint8_t* destination = memory_->TranslatePhysical(written_address);
+     if (destination) {
+       std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
++      DumpResolveForComparison(written_address, written_length, destination);
+     }
+   }
+ 
+diff --git a/src/graphics/pipeline/shader/shader.cpp b/src/graphics/pipeline/shader/shader.cpp
+index a53a222..087fada 100644
+--- a/src/graphics/pipeline/shader/shader.cpp
++++ b/src/graphics/pipeline/shader/shader.cpp
+@@ -159,3 +159,43 @@ Shader::Translation* Shader::CreateTranslationInstance(uint64_t modification) {
+ }
+ 
+ }  // namespace rex::graphics
++
++// Title-side renderers (gpu_skip_rendering) upload a shader's float constants themselves: how many
++// of the 256 registers of its bank (c0 up to the highest one it reads) the shader can read, from
++// the same ucode analysis that packs constants for the emulator's renderers. 256 when the shader
++// indexes constants dynamically. ucode_dwords is the raw (big-endian) microcode.
++#if defined(_WIN32)
++#define REX_SHADER_EXPORT __declspec(dllexport)
++#else
++#define REX_SHADER_EXPORT __attribute__((visibility("default")))
++#endif
++extern "C" REX_SHADER_EXPORT uint32_t rex_shader_float_constant_count(bool pixel, const uint32_t* ucode_dwords,
++                                                                       uint32_t dword_count) {
++  using namespace rex::graphics;
++  if (!ucode_dwords || !dword_count) return 256;
++  Shader shader(pixel ? xenos::ShaderType::kPixel : xenos::ShaderType::kVertex, 0, ucode_dwords, dword_count);
++  rex::string::StringBuffer disasm;
++  shader.AnalyzeUcode(disasm);
++  const auto& map = shader.constant_register_map();
++  if (map.float_dynamic_addressing) return 256;
++  for (int word = 3; word >= 0; --word)
++    if (map.float_bitmap[word]) return uint32_t(word * 64 + 64 - __builtin_clzll(map.float_bitmap[word]));
++  return 0;
++}
++
++// The same analysis as a bitmap of the float constant registers the shader reads (bit i of
++// out[i / 64] = register i of its bank). Returns false (all bits set) when it indexes them
++// dynamically.
++extern "C" REX_SHADER_EXPORT bool rex_shader_float_constant_bitmap(bool pixel, const uint32_t* ucode_dwords,
++                                                                    uint32_t dword_count, uint64_t out[4]) {
++  using namespace rex::graphics;
++  for (int i = 0; i < 4; ++i) out[i] = UINT64_MAX;
++  if (!ucode_dwords || !dword_count) return false;
++  Shader shader(pixel ? xenos::ShaderType::kPixel : xenos::ShaderType::kVertex, 0, ucode_dwords, dword_count);
++  rex::string::StringBuffer disasm;
++  shader.AnalyzeUcode(disasm);
++  const auto& map = shader.constant_register_map();
++  if (map.float_dynamic_addressing) return false;
++  for (int i = 0; i < 4; ++i) out[i] = map.float_bitmap[i];
++  return true;
++}
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..0a6a909 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <filesystem>
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+@@ -21,6 +22,10 @@
+ #include <utility>
+ #include <vector>
+ 
++#ifndef _WIN32
++#include <dlfcn.h>
++#endif
++
+ #include <SPIRV/GlslangToSpv.h>
+ #include <glslang/Public/ShaderLang.h>
+ #include <rex/assert.h>
+@@ -47,6 +52,30 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ // Legacy backend compatibility aliases for shared readback controls.
++REXCVAR_DEFINE_INT32(emu_resolve_dump_frame, 0, "GPU/Vulkan",
++                     "Write every resolve of this frame to logs/emu_dump (needs readback_resolve=full)");
++REXCVAR_DEFINE_INT32(emu_draw_dump_window, 1, "GPU/Vulkan",
++                     "Number of frames (from emu_resolve_dump_frame) whose draw constants are dumped");
++// A title-side renderer draws the frames: the command processor still executes the PM4 stream
++// (registers, fences, interrupts, swaps) but issues no host draws, resolves or presents.
++REXCVAR_DEFINE_BOOL(gpu_skip_rendering, false, "GPU/Vulkan",
++                    "Execute PM4 without rendering (a title-side renderer draws the frames)");
++// gtav native renderer: with gpu_skip_rendering the title's renderer replays frames some time
++// after this command processor executed them, yet fences written after a swap tell the game the
++// GPU is done with that frame's memory (it then streams new textures and vertex data into it).
++// When the title executable exports rex_skip_rendering_swap, this plugin calls it on the command
++// processor thread at every swap (0-based, in PM4 order); it blocks until the title's renderer
++// has read the frame's guest memory. (Same hook as the D3D12 backend.)
++using SkipRenderingSwapHook = void (*)(uint64_t swap_index);
++static SkipRenderingSwapHook ResolveSkipRenderingSwapHook() {
++#ifdef _WIN32
++  return reinterpret_cast<SkipRenderingSwapHook>(
++      GetProcAddress(GetModuleHandleW(nullptr), "rex_skip_rendering_swap"));
++#else
++  return reinterpret_cast<SkipRenderingSwapHook>(dlsym(RTLD_DEFAULT, "rex_skip_rendering_swap"));
++#endif
++}
++
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -1066,6 +1095,10 @@ bool VulkanCommandProcessor::SetupContext() {
+     shared_memory_descriptor_buffer_info.buffer = shared_memory_->buffer();
+     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
+     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
++    if (REXCVAR_GET(gpu_skip_rendering)) {  // the token buffer (VulkanSharedMemory::Initialize)
++      shared_memory_descriptor_buffer_info.offset = 0;
++      shared_memory_descriptor_buffer_info.range = VK_WHOLE_SIZE;
++    }
+   }
+   VkWriteDescriptorSet write_descriptor_sets[2];
+   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
+@@ -2275,7 +2308,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+-  if (!graphics_system_)
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    static uint64_t skip_swaps = 0;
++    static const SkipRenderingSwapHook hook = ResolveSkipRenderingSwapHook();
++    if (hook) hook(skip_swaps);
++    skip_swaps++;
++  }
++  if (!graphics_system_ || REXCVAR_GET(gpu_skip_rendering))
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
+   if (!presenter) {
+@@ -3594,8 +3633,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    return true;
++  }
+   const RegisterFile& regs = *register_file_;
+   (void)index_buffer_info;
++  DumpDrawConstantsForComparison(uint32_t(prim_type), index_count);
+   auto draw_fail = [&](const char* stage) {
+     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+     REXGPU_ERROR(
+@@ -4385,6 +4428,9 @@ bool VulkanCommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  if (REXCVAR_GET(gpu_skip_rendering)) {
++    return true;
++  }
+ 
+   if (!BeginSubmission(true)) {
+     return false;
+@@ -4400,6 +4446,64 @@ bool VulkanCommandProcessor::IssueCopy() {
+   return IssueCopy_ReadbackResolvePath();
+ }
+ 
++// emu_resolve_dump_frame: N = dump frames N..N+window-1; -1 (set by the game on F9) = from the next
++// frame on (same as the D3D12 backend).
++bool VulkanCommandProcessor::EmuDumpActive() {
++  int32_t frame = REXCVAR_GET(emu_resolve_dump_frame);
++  if (frame < 0) {
++    REXCVAR_SET(emu_resolve_dump_frame, 0);
++    emu_dump_target_ = frame_current_ + 1;
++  } else if (frame > 0) {
++    emu_dump_target_ = uint64_t(frame);
++  }
++  uint64_t window = uint64_t(std::max(1, REXCVAR_GET(emu_draw_dump_window)));
++  return emu_dump_target_ && frame_current_ >= emu_dump_target_ && frame_current_ < emu_dump_target_ + window;
++}
++
++// gtav native-renderer bring-up: with --emu_resolve_dump_frame=N (and readback_resolve=full),
++// every resolve of frame N is written to logs/emu_dump/frame_N/<seq>_<address>.bin in order, the
++// ground truth the native renderer's frame dump is compared against.
++void VulkanCommandProcessor::DumpResolveForComparison(uint32_t address, uint32_t length,
++                                                      const uint8_t* data) {
++  if (!EmuDumpActive()) return;
++  if (emu_dump_frame_ != frame_current_) {
++    emu_dump_frame_ = frame_current_;
++    emu_dump_sequence_ = 0;
++  }
++  const char* home = std::getenv("HOME");
++  std::filesystem::path dir = std::filesystem::path(home ? home : ".") / "gtav-linux/logs/emu_dump" /
++                              fmt::format("frame_{}", frame_current_);
++  std::error_code ec;
++  std::filesystem::create_directories(dir, ec);
++  auto path = dir / fmt::format("{:03}_{:08X}.bin", emu_dump_sequence_++, address);
++  if (FILE* f = std::fopen(path.c_str(), "wb")) {
++    std::fwrite(data, 1, length, f);
++    std::fclose(f);
++  }
++}
++
++// Same frame as above: every draw's primitive type, index count and the 512 ALU float constants
++// (host-endian), appended to logs/emu_dump/frame_N/draws.bin as
++// {u32 prim, u32 count, u64 pixel shader ucode hash, u32[2048]}.
++void VulkanCommandProcessor::DumpDrawConstantsForComparison(uint32_t prim, uint32_t count) {
++  // Draw constants are dumped for emu_draw_dump_window frames starting at emu_resolve_dump_frame
++  // (frame numbers here and in the game differ by a run-dependent offset; the comparison tool
++  // picks the matching frame by content).
++  if (!EmuDumpActive()) return;
++  const char* home = std::getenv("HOME");
++  std::filesystem::path dir = std::filesystem::path(home ? home : ".") / "gtav-linux/logs/emu_dump" /
++                              fmt::format("frame_{}", frame_current_);
++  std::error_code ec;
++  std::filesystem::create_directories(dir, ec);
++  if (FILE* f = std::fopen((dir / "draws.bin").c_str(), "ab")) {
++    uint64_t ps = active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0;
++    uint32_t header[4] = {prim, count, uint32_t(ps), uint32_t(ps >> 32)};
++    std::fwrite(header, 4, 4, f);
++    std::fwrite(&register_file_->values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4, 2048, f);
++    std::fclose(f);
++  }
++}
++
+ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+@@ -4682,6 +4786,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+     uint8_t* destination = memory_->TranslatePhysical(written_address);
+     if (destination) {
+       std::memcpy(destination, readback.mapped_data[read_index], written_length);
++      DumpResolveForComparison(written_address, written_length, destination);
+     }
+   }
+ 
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..b3355e9 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -3734,6 +3734,14 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+         }
+       }
+     }
++    // For stencil bit output from a depth source, the depth texture isn't
++    // loaded, so nothing above packs anything - use the stencil directly for the
++    // discard check. Otherwise no sample is discarded and every bit is written
++    // (stencil becomes 0xFF wherever the fallback for missing
++    // VK_EXT_shader_stencil_export is used, e.g. on Nvidia).
++    if (packed == spv::NoResult && mode.output == TransferOutput::kStencilBit) {
++      packed = source_stencil[0];
++    }
+     switch (mode.output) {
+       case TransferOutput::kColor: {
+         // Unless a special path was taken, unpack the raw 32bpp value into the
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 6788214..dbe172a 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -23,6 +23,9 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DECLARE(bool, gpu_skip_rendering);
++REXCVAR_DEFINE_BOOL(vulkan_skip_rendering_small_shared_memory, true, "GPU/Vulkan",
++                    "With gpu_skip_rendering, a 1 MB shared memory buffer instead of 512 MB");
+ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                     "Use sparse shared memory on Vulkan")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -56,6 +59,11 @@ bool VulkanSharedMemory::Initialize() {
+   buffer_create_info.pNext = nullptr;
+   buffer_create_info.flags = sparse_flags;
+   buffer_create_info.size = kBufferSize;
++  // A title-side renderer (gpu_skip_rendering) never draws through this buffer: a token 1 MB
++  // instead of 512 MB of GPU memory (8 GB Macs swap with it).
++  if (REXCVAR_GET(gpu_skip_rendering) && REXCVAR_GET(vulkan_skip_rendering_small_shared_memory)) {
++    buffer_create_info.size = 1 << 20;
++  }
+   buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..bf17297 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -10,7 +10,12 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <mutex>
+ #include <cmath>
++#include <vector>
+ 
+ #include <rex/dbg.h>
+ #include <rex/input/device_assignment.h>
+@@ -28,10 +33,82 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
+     .allowed({"sdl", "xinput"});
+ 
+ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
++REXCVAR_DEFINE_STRING(input_script, "", "Input",
++                      "Scripted pad for unattended runs: once this file exists, user 0 plays its lines "
++                      "'start_s dur_s buttons_hex lt rt lx ly rx ry' in a loop instead of the real pads");
+ namespace rex::input {
+ 
+ namespace {
+ 
++// --input_script: lets an unattended (hidden) run play the game, e.g. to reproduce audio glitches
++// that only happen during gameplay. The clock starts when the file first appears, so a capture
++// script can write it once the world is loaded.
++class InputScript {
++ public:
++  static InputScript& Get() {
++    static InputScript script;
++    return script;
++  }
++  bool State(X_INPUT_STATE* out) {
++    const std::string& path = REXCVAR_GET(input_script);
++    if (path.empty()) return false;
++    const auto now = std::chrono::steady_clock::now();
++    if (steps_.empty()) {
++      if (now < next_check_) return false;
++      next_check_ = now + std::chrono::seconds(1);
++      if (!std::filesystem::exists(path)) return false;
++      Load(path);
++      if (steps_.empty()) return false;
++      start_ = now;
++      REXLOG_INFO("input script: {} steps, loop {:.1f} s", steps_.size(), length_);
++    }
++    const double t = std::fmod(std::chrono::duration<double>(now - start_).count(), length_);
++    X_INPUT_GAMEPAD pad = {};
++    for (const Step& s : steps_) {
++      if (t < s.start || t >= s.start + s.duration) continue;
++      pad.buttons = uint16_t(pad.buttons | s.buttons);
++      pad.left_trigger = std::max<uint8_t>(pad.left_trigger, s.lt);
++      pad.right_trigger = std::max<uint8_t>(pad.right_trigger, s.rt);
++      if (s.lx || s.ly) pad.thumb_lx = s.lx, pad.thumb_ly = s.ly;
++      if (s.rx || s.ry) pad.thumb_rx = s.rx, pad.thumb_ry = s.ry;
++    }
++    out->packet_number = ++packet_;
++    out->gamepad = pad;
++    return true;
++  }
++
++ private:
++  struct Step {
++    double start, duration;
++    uint16_t buttons;
++    uint8_t lt, rt;
++    int16_t lx, ly, rx, ry;
++  };
++  void Load(const std::string& path) {
++    FILE* f = std::fopen(path.c_str(), "r");
++    if (!f) return;
++    char line[256];
++    while (std::fgets(line, sizeof(line), f)) {
++      double start, duration;
++      unsigned buttons, lt, rt;
++      int lx, ly, rx, ry;
++      if (std::sscanf(line, "%lf %lf %x %u %u %d %d %d %d", &start, &duration, &buttons, &lt, &rt, &lx,
++                      &ly, &rx, &ry) != 9)
++        continue;
++      steps_.push_back({start, duration, uint16_t(buttons), uint8_t(std::min(lt, 255u)),
++                        uint8_t(std::min(rt, 255u)), int16_t(std::clamp(lx, -32768, 32767)),
++                        int16_t(std::clamp(ly, -32768, 32767)), int16_t(std::clamp(rx, -32768, 32767)),
++                        int16_t(std::clamp(ry, -32768, 32767))});
++      length_ = std::max(length_, start + duration);
++    }
++    std::fclose(f);
++  }
++  std::vector<Step> steps_;
++  double length_ = 0;
++  uint32_t packet_ = 0;
++  std::chrono::steady_clock::time_point start_, next_check_;
++};
++
+ // Synthetic devices are parked past every physical ordinal so they cannot push
+ // a real pad off guest user 0. SlotAssignment routes them by their synthetic
+ // flag and never reads this value.
+@@ -187,6 +264,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -195,6 +273,17 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   std::vector<DeviceId> ids;
+   assignment_->DevicesForUser(user_index, ids);
+   if (ids.empty()) {
++    if (user_index == 0 && !REXCVAR_GET(input_script).empty()) {
++      // --input_script stands in for a standard pad when none is connected.
++      *out_caps = {};
++      out_caps->type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
++      out_caps->sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
++      out_caps->gamepad.buttons = 0xF3FF;
++      out_caps->gamepad.left_trigger = out_caps->gamepad.right_trigger = 0xFF;
++      out_caps->gamepad.thumb_lx = out_caps->gamepad.thumb_ly = int16_t(0xFFC0);
++      out_caps->gamepad.thumb_rx = out_caps->gamepad.thumb_ry = int16_t(0xFFC0);
++      return X_ERROR_SUCCESS;
++    }
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
+@@ -214,6 +303,14 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+ 
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
++  if (user_index == 0) {
++    X_INPUT_STATE scripted = {};
++    if (InputScript::Get().State(&scripted)) {
++      if (out_state) *out_state = scripted;
++      return X_ERROR_SUCCESS;
++    }
++  }
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -253,6 +350,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -295,6 +393,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard lock(mutex_);  // guest threads poll input concurrently; RefreshDevices rebuilds devices_
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..95eaccf 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -12,6 +12,8 @@
+ #include <array>
+ #include <filesystem>
+ 
++#include <atomic>
++#include <chrono>
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+@@ -669,7 +671,17 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+ }
+ 
+ void SDLInputDriver::QueueControllerUpdate() {
+-  // Pump SDL events to ensure controller state is up to date.
++  // Pump SDL events to ensure controller state is up to date. Titles poll every pad several times
++  // a frame; pumping on each poll kept the UI thread busy (on Android a whole big core, mostly in
++  // SDL's joystick detection), so pump at most every 4 ms.
++  static std::atomic<int64_t> last_pump_ns{0};
++  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                             std::chrono::steady_clock::now().time_since_epoch())
++                             .count();
++  if (now_ns - last_pump_ns.load(std::memory_order_relaxed) < 4000000) {
++    return;
++  }
++  last_pump_ns.store(now_ns, std::memory_order_relaxed);
+   bool is_queued = false;
+   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+   if (!is_queued) {
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index 1fda053..fe2e5e3 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
++#include <rex/kernel/xboxkrnl/threading.h>
+ 
+ #if REX_PLATFORM_WIN32
+ #include <windows.h>
+@@ -322,10 +323,15 @@ u32 XamLoaderGetDvdTrayState_entry(mapped_u32 out_state) {
+   return X_STATUS_SUCCESS;
+ }
+ 
+-u32 XamSwapDisc_entry(u32 disc_number) {
+-  // Stub for multi-disc games. Single-disc games (like Blue Dragon's reblue test)
+-  // don't need this, but the game may look it up dynamically via XexGetProcedureAddress.
+-  REXKRNL_DEBUG("XamSwapDisc({}) - stub, returning success", (uint32_t)disc_number);
++u32 XamSwapDisc_entry(u32 disc_number, ppc_ptr_t<X_KEVENT> completion_event,
++                      mapped_void error_string) {
++  // Multi-disc games wait on completion_event after asking for the next disc. The
++  // host mounts the requested disc's files as game: up front, so report the swap
++  // as done immediately.
++  REXKRNL_DEBUG("XamSwapDisc({}) - completing immediately", (uint32_t)disc_number);
++  if (completion_event) {
++    xboxkrnl::xeKeSetEvent(completion_event, 1, 0);
++  }
+   return X_STATUS_SUCCESS;
+ }
+ 
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..b1006d6 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -22,6 +22,10 @@
+ #include <rex/platform.h>
+ #include <rex/platform/dynlib.h>
+ 
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++#endif
++
+ namespace rex::system {
+ 
+ namespace {
+@@ -56,6 +60,15 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
+   auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
++#if REX_PLATFORM_ANDROID
++  // The executable is app_process; plugins sit next to librexruntime.so in the app's lib dir.
++  {
++    Dl_info info{};
++    if (dladdr(reinterpret_cast<void*>(&LoadGpuPlugin), &info) && info.dli_fname) {
++      path = std::filesystem::path(info.dli_fname).parent_path() / PluginFileName(name);
++    }
++  }
++#endif
+   if (!std::filesystem::exists(path)) {
+     REXSYS_ERROR(
+         "GPU plugin '{}' not found at {}. Stage it next to the executable "
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index bd6c797..57d3f44 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -156,8 +156,10 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+     }
+ 
+     XCONTENT_AGGREGATE_DATA content_data;
+-    if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
+-                                         content_type, content_data))) {
++    // ReadContentHeaderFile returns Win32 codes; XSUCCEEDED treats X_ERROR_FILE_NOT_FOUND (2) as
++    // success, which left content_data uninitialized for packages without a header file.
++    if (ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id, content_type,
++                              content_data) == X_ERROR_SUCCESS) {
+       result.emplace_back(std::move(content_data));
+     } else {
+       content_data.device_id = device_id;
+diff --git a/src/system/xevent.cpp b/src/system/xevent.cpp
+index c24fbd1..0663781 100644
+--- a/src/system/xevent.cpp
++++ b/src/system/xevent.cpp
+@@ -74,11 +74,13 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
+ }
+ 
+ int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
++  TraceHandleOp("set");
+   event_->Set();
+   return 1;
+ }
+ 
+ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
++  TraceHandleOp("pulse");
+   event_->Pulse();
+   return 1;
+ }
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..ff4ba63 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -13,7 +13,7 @@
+ #include <cstring>
+ #include <utility>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ #include <sys/mman.h>
+ #endif
+ 
+@@ -363,6 +363,27 @@ int Memory::MapViews(uint8_t* mapping_base) {
+   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
+   // side if system allocation granularity is bigger than 4 KB.
+   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
++#if REX_PLATFORM_ANDROID
++  // The views are mapped with MAP_FIXED, which silently replaces whatever is already there. On a
++  // desktop the low 64 GB are empty, but on Android the GPU driver, Scudo and ART map there, and
++  // a replaced driver mapping faults forever (vkCreateSwapchainKHR spun in the fault handler).
++  // Reserve the whole span without replacing anything first; the views then replace only it.
++  {
++    uint64_t span = 0;
++    for (size_t n = 0; n < rex::countof(map_info); n++) {
++      span = std::max<uint64_t>(span, map_info[n].virtual_address_end + 1);
++    }
++    void* reserved = mmap(mapping_base, span, PROT_NONE,
++                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
++    if (reserved == MAP_FAILED) {
++      return 1;
++    }
++    if (reserved != mapping_base) {
++      munmap(reserved, span);
++      return 1;
++    }
++  }
++#endif
+   for (size_t n = 0; n < rex::countof(map_info); n++) {
+     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
+         mapping_, mapping_base + map_info[n].virtual_address_start,
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index d358f39..145de50 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -10,8 +10,15 @@
+  */
+ 
+ #include <vector>
++#include <rex/cvar.h>
++#include <atomic>
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/memory/utils.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
+@@ -200,6 +207,61 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+   }
+ }
+ 
++REXCVAR_DEFINE_STRING(trace_handles, "", "Kernel",
++                      "Log waits/signals on a guest handle range, e.g. F8000910-F8000924 (debugging)");
++
++void XObject::TraceHandleOp(const char* op) {
++  static uint32_t lo = 0, hi = 0;
++  static std::atomic<int> budget{-1};
++  if (budget.load() < 0) {
++    auto spec = REXCVAR_GET(trace_handles);
++    auto dash = spec.find('-');
++    if (dash != std::string::npos) {
++      lo = uint32_t(std::stoul(spec.substr(0, dash), nullptr, 16));
++      hi = uint32_t(std::stoul(spec.substr(dash + 1), nullptr, 16));
++    }
++    budget = 5000;
++  }
++  uint32_t h = handle();
++  if (!lo || h < lo || h > hi || budget.fetch_sub(1) <= 0) return;
++  auto* thread = XThread::IsInThread() ? XThread::GetCurrentThread() : nullptr;
++  uint32_t lr = thread && thread->thread_state() ? uint32_t(thread->thread_state()->context()->lr) : 0;
++  REXSYS_WARN("trace {} handle {:08X} thread {} lr {:08X}", op, h, thread ? thread->thread_id() : 0, lr);
++}
++
++void XObject::ReportLongWait() {
++  auto* thread = XThread::IsInThread() ? XThread::GetCurrentThread() : nullptr;
++  if (!thread || !thread->thread_state()) {
++    REXSYS_WARN("long wait (>15s): host thread on handle {:08X} type {}", handle(), int(type()));
++    return;
++  }
++  auto* ctx = thread->thread_state()->context();
++  auto* mem = memory();
++  // Guest call chain from the PPC back-chain: [sp] = caller sp, saved LR at caller_sp - 8.
++  std::string chain = fmt::format("{:08X}", uint32_t(ctx->lr));
++  uint32_t sp = ctx->r1.u32;
++  // Only touch committed, readable guest pages: a bad back-chain must never fault.
++  auto readable = [mem](uint32_t guest) {
++#ifdef _WIN32
++    MEMORY_BASIC_INFORMATION mbi{};
++    auto* host = mem->TranslateVirtual(guest);
++    return VirtualQuery(host, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
++           (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
++                           PAGE_EXECUTE_READWRITE)) && !(mbi.Protect & PAGE_GUARD);
++#else
++    return false;
++#endif
++  };
++  for (int i = 0; i < 10 && readable(sp); i++) {
++    uint32_t caller_sp = rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(sp));
++    if (caller_sp <= sp || caller_sp - sp > 0x100000 || !readable(caller_sp - 8)) break;
++    chain += fmt::format(" < {:08X}", rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(caller_sp - 8)));
++    sp = caller_sp;
++  }
++  REXSYS_WARN("long wait (>15s): thread {} on handle {:08X} type {} | lr chain {}",
++              thread->thread_id(), handle(), int(type()), chain);
++}
++
+ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                        uint64_t* opt_timeout) {
+   auto wait_handle = GetWaitHandle();
+@@ -212,8 +274,19 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+ 
++  TraceHandleOp(opt_timeout ? "wait(timed)" : "wait");
+   XThread::CheckTitleTermination();
+-  auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++  auto result = rex::thread::WaitResult::kTimeout;
++  if (!opt_timeout) {
++    // Long-wait watchdog: report infinite waits that last over 15 s, then keep waiting.
++    result = rex::thread::Wait(wait_handle, alertable ? true : false, std::chrono::seconds(15));
++    if (result == rex::thread::WaitResult::kTimeout) {
++      ReportLongWait();
++      result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++    }
++  } else {
++    result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++  }
+   XThread::CheckTitleTermination();
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+@@ -264,6 +337,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+                                uint64_t* opt_timeout) {
+   std::vector<rex::thread::WaitHandle*> wait_handles(count);
+   for (size_t i = 0; i < count; ++i) {
++    objects[i]->TraceHandleOp("wait-multi");
+     wait_handles[i] = objects[i]->GetWaitHandle();
+     assert_not_null(wait_handles[i]);
+   }
+diff --git a/src/system/xsemaphore.cpp b/src/system/xsemaphore.cpp
+index db830e4..f053f2a 100644
+--- a/src/system/xsemaphore.cpp
++++ b/src/system/xsemaphore.cpp
+@@ -39,6 +39,7 @@ bool XSemaphore::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
+ }
+ 
+ bool XSemaphore::ReleaseSemaphore(int32_t release_count, int32_t* out_previous_count) {
++  TraceHandleOp("release");
+   int32_t previous_count = 0;
+   bool success = semaphore_->Release(release_count, &previous_count);
+   if (out_previous_count) {
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..adff0de 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -68,6 +68,10 @@ if(WIN32)
+     set(REXUI_PLATFORM_SOURCES
+         surface_win.cpp
+     )
++elseif(ANDROID)
++    set(REXUI_PLATFORM_SOURCES
++        surface_android.cpp
++    )
+ elseif(APPLE)
+     set(REXUI_PLATFORM_SOURCES
+         surface_mac.cpp
+@@ -146,7 +150,9 @@ if(REXGLUE_USE_VULKAN)
+ endif()
+ 
+ # Platform-specific dependencies
+-if(UNIX AND NOT APPLE)
++if(ANDROID)
++    target_link_libraries(rexui PUBLIC android log)
++elseif(UNIX AND NOT APPLE)
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..b112566 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -46,6 +46,9 @@
+ #include <filesystem>
+ #include <string_view>
+ 
++REXCVAR_DEFINE_BOOL(window_presenter, true, "UI",
++                    "Attach the emulated GPU's presenter to the window (off when the title presents "
++                    "to the window with its own renderer)");
+ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
+                       "GPU emulation")
+@@ -369,7 +372,11 @@ bool ReXApp::SetupPresentation() {
+         SetupOverlays(presenter, immediate_drawer_.get());
+       }
+     }
+-    window_->SetPresenter(presenter);
++    // A window has one surface on Android: a title that presents to the window itself (GTA V's
++    // native renderer under gpu_skip_rendering) needs the emulated presenter kept off it.
++    if (REXCVAR_GET(window_presenter)) {
++      window_->SetPresenter(presenter);
++    }
+   } else if (!graphics_system) {
+     // Detached mode: the app brings its own renderer and drives its own paint
+     // loop. ReXApp owns the returned drawer via immediate_drawer_.
+diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
+new file mode 100644
+index 0000000..913511e
+--- /dev/null
++++ b/src/ui/surface_android.cpp
+@@ -0,0 +1,28 @@
++/**
++ * @file        rex/ui/surface_android.cpp
++ * @brief       Android ANativeWindow surface
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include <rex/ui/surface_android.h>
++
++#include <android/native_window.h>
++
++namespace rex {
++namespace ui {
++
++bool AndroidNativeWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
++  int width = ANativeWindow_getWidth(window_);
++  int height = ANativeWindow_getHeight(window_);
++  if (width <= 0 || height <= 0) {
++    return false;
++  }
++  width_out = uint32_t(width);
++  height_out = uint32_t(height);
++  return true;
++}
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..0c76c51 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -16,6 +16,7 @@
+ #include <vector>
+ 
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/instance.h>
+@@ -50,6 +51,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
+ 
+   std::vector<std::filesystem::path> loader_candidates = macos_runtime_paths.loader_candidates;
++#if REX_PLATFORM_IOS
++  // No loader on iOS: the app bundle carries MoltenVK itself (signed with the app).
++  loader_candidates.insert(loader_candidates.begin(),
++                           rex::filesystem::GetExecutableFolder() / "libMoltenVK.dylib");
++#endif
+   loader_candidates.emplace_back(platform::lib_names::kVulkanLoader);
+   loader_candidates.emplace_back("libvulkan.dylib");
+   loader_candidates.emplace_back("libMoltenVK.dylib");
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..f7aeaf0 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -35,6 +35,8 @@
+ #include <SDL3/SDL_metal.h>
+ 
+ #include <rex/ui/surface_mac.h>
++#elif REX_PLATFORM_ANDROID
++#include <rex/ui/surface_android.h>
+ #else
+ #include <X11/Xlib-xcb.h>
+ #include <rex/ui/surface_gnulinux.h>
+@@ -398,6 +400,14 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+       SDL_Metal_DestroyView(metal_view);
+     }
+   }
++#elif REX_PLATFORM_ANDROID
++  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
++    auto* native_window = static_cast<ANativeWindow*>(SDL_GetPointerProperty(
++        SDL_GetWindowProperties(sdl_window_), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
++    if (native_window) {
++      return std::make_unique<AndroidNativeWindowSurface>(native_window);
++    }
++  }
+ #else
+   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..0742758 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -9,6 +9,9 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <map>
++#include <string>
++#include <fmt/format.h>
+ #include <rex/ui/windowed_app_context_sdl.h>
+ 
+ #include <cstdlib>
+@@ -41,7 +44,11 @@ bool SDLWindowedAppContext::Initialize() {
+   // Picked before SDL_InitSubSystem, long before a graphics instance can say
+   // which surface extensions it has, so the cvar is the escape hatch.
+   std::string requested_driver = REXCVAR_GET(video_driver);
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_IOS
++  if (requested_driver.empty()) {
++    requested_driver = "uikit";
++  }
++#elif REX_PLATFORM_MAC
+   // macOS presents via a CAMetalLayer surface obtained from the Cocoa driver.
+   if (requested_driver.empty()) {
+     requested_driver = "cocoa";
+@@ -91,6 +98,21 @@ int SDLWindowedAppContext::RunMainMessageLoop() {
+       REXLOG_ERROR("SDL_WaitEvent failed: {}", SDL_GetError());
+       return EXIT_FAILURE;
+     }
++#if REX_PLATFORM_ANDROID
++    // Diagnostics: which events keep the UI thread awake (logged every 5 s).
++    {
++      static std::map<uint32_t, uint32_t> counts;
++      static uint64_t since = SDL_GetTicks();
++      counts[event.type]++;
++      if (SDL_GetTicks() - since > 5000) {
++        std::string line;
++        for (auto& [type, n] : counts) line += fmt::format(" {:X}:{}", type, n);
++        REXLOG_INFO("UI thread events in 5 s:{}", line);
++        counts.clear();
++        since = SDL_GetTicks();
++      }
++    }
++#endif
+     ProcessEvent(event);
+   }
+   return EXIT_SUCCESS;
+diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
+index 77bb1dc..4b57917 100644
+--- a/src/ui/windowed_app_main_sdl.cpp
++++ b/src/ui/windowed_app_main_sdl.cpp
+@@ -22,6 +22,11 @@
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_sdl.h>
+ 
++#if REX_PLATFORM_ANDROID
++// Renames main to SDL_main, which SDLActivity looks up in libmain.so and calls on its thread.
++#include <SDL3/SDL_main.h>
++#endif
++
+ #if REX_PLATFORM_WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+@@ -124,6 +129,80 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+   return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+ }
+ 
++#elif REX_PLATFORM_IOS
++
++// iOS: UIKit must own the main thread, so main() hands over to SDL_RunApp (UIApplicationMain),
++// which calls back into RunWindowedApp once the app has finished launching. An app gets no
++// command line from the home screen: arguments come from Documents/args.txt (one per line or
++// space separated, # comments), appended after any that were passed (devicectl --  args).
++#define SDL_MAIN_HANDLED
++#include <SDL3/SDL_main.h>
++#include <fstream>
++#include <sstream>
++#include <unistd.h>
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++
++namespace {
++std::vector<std::string> g_ios_args;
++std::vector<char*> g_ios_argv;
++
++int IosMain(int argc, char* argv[]) {
++  // Again here: SDL's app delegate changes to the (read-only) bundle directory before this runs.
++  if (const char* home = std::getenv("HOME")) {
++    std::string docs = std::string(home) + "/Documents";
++    int rc = chdir(docs.c_str());
++    char cwd[1024] = {};
++    getcwd(cwd, sizeof(cwd));
++    std::error_code ec;
++    std::filesystem::create_directories("logs", ec);
++    FILE* probe = std::fopen("logs/.probe", "w");
++    std::fprintf(stderr, "[ios] chdir(%s)=%d cwd=%s logs:%s probe:%s (%s)\n", docs.c_str(), rc, cwd,
++                 ec ? ec.message().c_str() : "ok", probe ? "ok" : "fail", probe ? "" : std::strerror(errno));
++    if (probe) std::fclose(probe);
++  }
++  return RunWindowedApp(argc, argv);
++}
++}  // namespace
++
++int main(int argc, char* argv[]) {
++  for (int i = 0; i < argc; ++i) {
++    g_ios_args.emplace_back(argv[i]);
++  }
++  auto read_args = [](const std::string& path) {
++    std::ifstream file(path);
++    std::string line;
++    while (std::getline(file, line)) {
++      if (auto hash = line.find('#'); hash != std::string::npos) {
++        line.resize(hash);
++      }
++      std::istringstream words(line);
++      std::string word;
++      while (words >> word) {
++        g_ios_args.push_back(word);
++      }
++    }
++  };
++  // The app's own defaults (args.txt inside the bundle, next to the executable) first, then the
++  // player's Documents/args.txt, whose settings come later and so win.
++  if (argc > 0) {
++    read_args((std::filesystem::path(argv[0]).parent_path() / "args.txt").string());
++  }
++  if (const char* home = std::getenv("HOME")) {
++    // Relative paths in args.txt (game data, logs) are relative to Documents: the container's
++    // absolute path changes with every install.
++    chdir((std::string(home) + "/Documents").c_str());
++    read_args(std::string(home) + "/Documents/args.txt");
++  }
++  for (auto& arg : g_ios_args) {
++    g_ios_argv.push_back(arg.data());
++  }
++  g_ios_argv.push_back(nullptr);
++  return SDL_RunApp(static_cast<int>(g_ios_args.size()), g_ios_argv.data(), IosMain, nullptr);
++}
++
+ #else
+ 
+ int main(int argc, char* argv[]) {
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..3030ad5 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -49,7 +49,7 @@ if(REXGLUE_USE_VULKAN)
+         vulkan-headers vulkan-memory-allocator
+         spirv-headers spirv-tools glslang
+     )
+-    if(APPLE)
++    if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+         list(APPEND REQUIRED_SUBMODULES vulkan-loader moltenvk)
+     endif()
+ endif()
+@@ -201,7 +201,9 @@ if(REXGLUE_USE_VULKAN)
+     set(VMA_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
+     add_subdirectory(vulkan-memory-allocator)
+ 
+-    if(APPLE)
++    # iOS: no Vulkan loader; the app embeds a prebuilt MoltenVK (ios-arm64) and the runtime
++    # opens it from the app bundle.
++    if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+         # Build the loader and MoltenVK revisions shipped by the pinned SDK.
+         # They remain runtime-loaded; no Vulkan implementation is linked into
+         # rexglue itself.
+@@ -234,8 +236,12 @@ add_library(imgui OBJECT
+     ${IMGUI_DIR}/imgui_draw.cpp
+     ${IMGUI_DIR}/imgui_tables.cpp
+     ${IMGUI_DIR}/imgui_widgets.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/imgui_rex_context.cpp
+ )
+ add_library(imgui::imgui ALIAS imgui)
++# Per-thread current context (imgui_rex_config.h).
++target_compile_definitions(imgui PRIVATE
++    IMGUI_USER_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/imgui_rex_config.h")
+ target_include_directories(imgui PUBLIC
+     $<BUILD_INTERFACE:${IMGUI_DIR}>
+     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+diff --git a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+index 32d427d..23fd3e1 100644
+--- a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
++++ b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+@@ -118,11 +118,11 @@ namespace disruptorplus
+                 std::unique_lock<std::mutex> lock(m_mutex);
+                 m_cv.wait_for(
+                     lock,
++                    timeout,
+                     [&]() -> bool {
+                         result = minimum_sequence_after(sequence, count, sequences);
+                         return difference(result, sequence) >= 0;
+-                    },
+-                    timeout);
++                    });
+             }
+             return result;
+         }
+@@ -171,11 +171,11 @@ namespace disruptorplus
+                 std::unique_lock<std::mutex> lock(m_mutex);
+                 m_cv.wait_until(
+                     lock,
++                    timeoutTime,
+                     [&]() -> bool {
+                         result = minimum_sequence_after(sequence, count, sequences);
+                         return difference(result, sequence) >= 0;
+-                    },
+-                    timeoutTime);
++                    });
+             }
+             return result;
+         }
+diff --git a/thirdparty/imgui_rex_config.h b/thirdparty/imgui_rex_config.h
+new file mode 100644
+index 0000000..0fdc5e9
+--- /dev/null
++++ b/thirdparty/imgui_rex_config.h
+@@ -0,0 +1,8 @@
++// Dear ImGui build configuration for the runtime (thirdparty/CMakeLists.txt, IMGUI_USER_CONFIG).
++// The current context is per thread: the SDK's ImGuiDrawer switches contexts on the UI thread for
++// every input event while games can run their own context on a render thread (GTA V's native
++// renderer menu); with one process-wide GImGui the two threads swapped contexts under each other.
++#pragma once
++struct ImGuiContext;
++extern thread_local ImGuiContext* RexImGuiContextTLS;
++#define GImGui RexImGuiContextTLS
+diff --git a/thirdparty/imgui_rex_context.cpp b/thirdparty/imgui_rex_context.cpp
+new file mode 100644
+index 0000000..b961317
+--- /dev/null
++++ b/thirdparty/imgui_rex_context.cpp
+@@ -0,0 +1,4 @@
++// Storage of the per-thread ImGui context (see imgui_rex_config.h).
++#include "imgui_rex_config.h"
++
++thread_local ImGuiContext* RexImGuiContextTLS = nullptr;
