@@ -1,0 +1,976 @@
+diff --git a/XenosRecomp/pch.h b/XenosRecomp/pch.h
+index e59682c..c9592ad 100644
+--- a/XenosRecomp/pch.h
++++ b/XenosRecomp/pch.h
+@@ -12,6 +12,7 @@
+ #include <execution>
+ #include <filesystem>
+ #include <map>
++#include <set>
+ #include <smolv.h>
+ #include <fmt/core.h>
+ #include <string>
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..391583b 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -26,25 +26,47 @@ struct PushConstants
+ 
+ [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+ 
+-#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+-#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+-#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+-#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
++#define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 512)
++#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 516)
++#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 520)
++#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 528)
++#define g_AlphaToMask              vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 532)
++#define g_NdcScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 536)
++#define g_NdcOffset                vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 544)
++#define g_AlphaFunc                vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 552)
++#define g_ColorScale(INDEX)        vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 560 + (INDEX) * 16)
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
++// Host pixels per guest pixel, inverted (render scale below 1): vPos stays in guest pixels.
++[[vk::constant_id(1)]] const float g_PixelScaleInv = 1.0;
+ 
+ #define g_SpecConstants() g_SpecConstants
+ 
+ #else
+ 
+ #define DEFINE_SHARED_CONSTANTS() \
+-    uint g_Booleans : packoffset(c16.x); \
+-    uint g_SwappedTexcoords : packoffset(c16.y); \
+-    float2 g_HalfPixelOffset : packoffset(c16.z); \
+-    float g_AlphaThreshold : packoffset(c17.x);
++    uint g_Booleans : packoffset(c32.x); \
++    uint g_SwappedTexcoords : packoffset(c32.y); \
++    float2 g_HalfPixelOffset : packoffset(c32.z); \
++    float g_AlphaThreshold : packoffset(c33.x);     uint g_AlphaToMask : packoffset(c33.y); \
++    float2 g_NdcScale : packoffset(c33.z); \
++    float2 g_NdcOffset : packoffset(c34.x); \
++    uint g_AlphaFunc : packoffset(c34.z); \
++    float4 g_ColorScaleArray[4] : packoffset(c35);
+ 
+ uint g_SpecConstants();
+ 
++#define g_PixelScaleInv 1.0
++
++#define g_ColorScale(INDEX) g_ColorScaleArray[INDEX]
++
++#endif
++
++// Vertex shaders have no derivatives: sample mip 0 there, like Xenos vertex texture fetch.
++#if defined(__SHADER_TARGET_STAGE) && __SHADER_TARGET_STAGE == __SHADER_STAGE_VERTEX
++#define XENOS_SAMPLE(texture, samplerState, texCoord) (texture).SampleLevel(samplerState, texCoord, 0)
++#else
++#define XENOS_SAMPLE(texture, samplerState, texCoord) (texture).Sample(samplerState, texCoord)
+ #endif
+ 
+ Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+@@ -59,16 +81,54 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+     return dimensions;
+ }
+ 
++// GTA V: like the SDK's shader translator (kRoundingOffset), every fetch gets 1.5/1024 texel added
++// to its offset. With D3D9 pixel centres, screen-space passes put coordinates exactly on texel
++// edges, and point sampling then picks texel i or i-1 depending on interpolation rounding (the
++// ocean wave simulation became a blend of neighbours and drifted).
++#define XENOS_FETCH_ROUNDING (1.5 / 1024.0)
++
++// 1D textures are bound as 2D textures of height 1.
++float4 tfetch1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex],
++                        float2(texCoord + XENOS_FETCH_ROUNDING / getTexture2DDimensions(texture).x, 0.5));
++}
++
++float getWeights1D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture).x + XENOS_FETCH_ROUNDING - 0.5));
++}
++
++// GTA V: fetches with unnormalized coordinates (texCoordDenorm) address texels of the base level.
++float denorm1D(uint resourceDescriptorIndex, float texCoord)
++{
++    return texCoord / getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]).x;
++}
++
++float2 denorm2D(uint resourceDescriptorIndex, float2 texCoord)
++{
++    return texCoord / getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]);
++}
++
++float3 denorm3D(uint resourceDescriptorIndex, float3 texCoord)
++{
++    uint w, h, d;
++    g_Texture3DDescriptorHeap[resourceDescriptorIndex].GetDimensions(w, h, d);
++    return texCoord / float3(w, h, d);
++}
++
+ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    return XENOS_SAMPLE(texture, g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + (offset + XENOS_FETCH_ROUNDING) / getTexture2DDimensions(texture));
+ }
+ 
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
++    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset + XENOS_FETCH_ROUNDING - 0.5));
+ }
+ 
+ float w0(float a)
+@@ -135,17 +195,24 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     float h1y = h1(fy);
+ 
+     float4 r =
+-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
+-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
++        g0(fy) * (g0x * XENOS_SAMPLE(texture, samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
++            g1x * XENOS_SAMPLE(texture, samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
++        g1(fy) * (g0x * XENOS_SAMPLE(texture, samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
++            g1x * XENOS_SAMPLE(texture, samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+ 
+     return r;
+ }
+ 
++float3 roundingOffset3D(uint resourceDescriptorIndex)
++{
++    uint w, h, d;
++    g_Texture3DDescriptorHeap[resourceDescriptorIndex].GetDimensions(w, h, d);
++    return XENOS_FETCH_ROUNDING / float3(w, h, d);
++}
++
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
+-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    return XENOS_SAMPLE(g_Texture3DDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + roundingOffset3D(resourceDescriptorIndex));
+ }
+ 
+ struct CubeMapData
+@@ -156,7 +223,54 @@ struct CubeMapData
+ 
+ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++    return XENOS_SAMPLE(g_TextureCubeDescriptorHeap[resourceDescriptorIndex], g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++}
++
++// GTA V: fetches with an explicit LOD (setTexLOD + UseRegisterLOD, or computed LOD disabled).
++float4 tfetch1DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float texCoord, float lod)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
++                               float2(texCoord + XENOS_FETCH_ROUNDING / getTexture2DDimensions(texture).x, 0.5), lod);
++}
++
++float4 tfetch2DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + (offset + XENOS_FETCH_ROUNDING) / getTexture2DDimensions(texture), lod);
++}
++
++// GTA V: fetches whose instruction overrides the filter to point (mag and min) read one texel, as
++// the hardware does; the descriptor's sampler is the fetch constant's (usually linear), which
++// blended depths across edges in min/max depth downsamples (tiled lighting data).
++float4 tfetch2DPoint(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    int2 dims = int2(getTexture2DDimensions(texture));
++    int2 p = clamp(int2(floor(texCoord * float2(dims) + offset + XENOS_FETCH_ROUNDING)), int2(0, 0), dims - 1);
++    return texture.Load(int3(p, 0));
++}
++
++float4 tfetch2DLodPoint(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
++    uint w, h, levels;
++    texture.GetDimensions(0, w, h, levels);
++    uint mip = uint(clamp(round(lod), 0.0, float(levels - 1)));
++    texture.GetDimensions(mip, w, h, levels);
++    int2 dims = int2(w, h);
++    int2 p = clamp(int2(floor(texCoord * float2(dims) + offset + XENOS_FETCH_ROUNDING)), int2(0, 0), dims - 1);
++    return texture.Load(int3(p, mip));
++}
++
++float4 tfetch3DLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)
++{
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + roundingOffset3D(resourceDescriptorIndex), lod);
++}
++
++float4 tfetchCubeLod(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float lod)
++{
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z], lod);
+ }
+ 
+ float4 tfetchR11G11B10(uint4 value)
+@@ -180,6 +294,116 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
+     return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
+ }
+ 
++#ifdef __spirv__
++
++// GTA V: vertex fetches with a computed index (tiled lighting, skinning palettes) read the guest
++// vertex buffer directly. Per input location the host provides a 32-byte record at
++// SharedConstants + 768 + location * 32: the stream's raw guest data address (with the fetch
++// constant's endian mode in the low two bits), the stride and the element offset in dwords, and
++// the element's D3DDECLTYPE (Xenos format in bits 0-5, signed 0x100, integer 0x200).
++uint vfetchSwap(uint w, uint endian)
++{
++    if (endian == 1 || endian == 2)
++        w = ((w & 0x00FF00FF) << 8) | ((w >> 8) & 0x00FF00FF);  // 8in16
++    if (endian == 2 || endian == 3)
++        w = (w << 16) | (w >> 16);  // 8in32 = 8in16 then 16in32
++    return w;
++}
++
++float vfetchFraction(uint value, uint width, bool isSigned, bool isInteger, bool noZero)
++{
++    if (!isSigned)
++        return isInteger ? float(value) : float(value) / float((1u << width) - 1);
++    int s = int(value << (32 - width)) >> (32 - width);
++    if (isInteger)
++        return float(s);
++    if (noZero)
++        return (float(s) * 2.0 + 1.0) / float((1u << width) - 1);
++    return max(float(s) / float((1u << (width - 1)) - 1), -1.0);
++}
++
++float4 vfetchIndirect(uint location, float index, bool rounded)
++{
++    uint64_t record = g_PushConstants.SharedConstants + 768 + location * 32;
++    uint64_t base = vk::RawBufferLoad<uint64_t>(record, 8);
++    if (base == 0)
++        return float4(0.0, 0.0, 0.0, 1.0);
++    uint stride = vk::RawBufferLoad<uint>(record + 8);
++    int offset = vk::RawBufferLoad<int>(record + 12);
++    uint type = vk::RawBufferLoad<uint>(record + 16);
++    uint format = type & 0x3F;
++    bool isSigned = (type & 0x100) != 0, isInteger = (type & 0x200) != 0, noZero = false;
++    uint endian = uint(base & 3);
++    base &= ~3ull;
++    int element = int(floor(rounded ? index + 0.5 : index));
++    uint64_t address = base + uint64_t(int64_t(element * int(stride) + offset) * 4);
++    uint w0 = vfetchSwap(vk::RawBufferLoad<uint>(address), endian);
++    float4 r = float4(0.0, 0.0, 0.0, 1.0);
++    switch (format)
++    {
++    case 6: // k_8_8_8_8
++        r = float4(vfetchFraction(w0 & 0xFF, 8, isSigned, isInteger, noZero),
++                   vfetchFraction((w0 >> 8) & 0xFF, 8, isSigned, isInteger, noZero),
++                   vfetchFraction((w0 >> 16) & 0xFF, 8, isSigned, isInteger, noZero),
++                   vfetchFraction(w0 >> 24, 8, isSigned, isInteger, noZero));
++        break;
++    case 7: // k_2_10_10_10
++        r = float4(vfetchFraction(w0 & 0x3FF, 10, isSigned, isInteger, noZero),
++                   vfetchFraction((w0 >> 10) & 0x3FF, 10, isSigned, isInteger, noZero),
++                   vfetchFraction((w0 >> 20) & 0x3FF, 10, isSigned, isInteger, noZero),
++                   vfetchFraction(w0 >> 30, 2, isSigned, isInteger, noZero));
++        break;
++    case 25: // k_16_16
++        r.xy = float2(vfetchFraction(w0 & 0xFFFF, 16, isSigned, isInteger, noZero),
++                      vfetchFraction(w0 >> 16, 16, isSigned, isInteger, noZero));
++        break;
++    case 26: // k_16_16_16_16
++    {
++        uint w1 = vfetchSwap(vk::RawBufferLoad<uint>(address + 4), endian);
++        r = float4(vfetchFraction(w0 & 0xFFFF, 16, isSigned, isInteger, noZero),
++                   vfetchFraction(w0 >> 16, 16, isSigned, isInteger, noZero),
++                   vfetchFraction(w1 & 0xFFFF, 16, isSigned, isInteger, noZero),
++                   vfetchFraction(w1 >> 16, 16, isSigned, isInteger, noZero));
++        break;
++    }
++    case 31: // k_16_16_FLOAT
++        r.xy = f16tof32(uint2(w0 & 0xFFFF, w0 >> 16));
++        break;
++    case 32: // k_16_16_16_16_FLOAT
++    {
++        uint w1 = vfetchSwap(vk::RawBufferLoad<uint>(address + 4), endian);
++        r = f16tof32(uint4(w0 & 0xFFFF, w0 >> 16, w1 & 0xFFFF, w1 >> 16));
++        break;
++    }
++    case 33: // k_32
++    case 34: // k_32_32
++    case 35: // k_32_32_32_32
++    {
++        uint count = format - 32;
++        r.x = isSigned ? float(int(w0)) : float(w0);
++        if (count > 1) { uint w = vfetchSwap(vk::RawBufferLoad<uint>(address + 4), endian); r.y = isSigned ? float(int(w)) : float(w); }
++        if (count > 2) { uint w = vfetchSwap(vk::RawBufferLoad<uint>(address + 8), endian); r.z = isSigned ? float(int(w)) : float(w); }
++        if (count > 3) { uint w = vfetchSwap(vk::RawBufferLoad<uint>(address + 12), endian); r.w = isSigned ? float(int(w)) : float(w); }
++        break;
++    }
++    case 36: // k_32_FLOAT
++    case 37: // k_32_32_FLOAT
++    case 38: // k_32_32_32_32_FLOAT
++    case 57: // k_32_32_32_FLOAT
++    {
++        uint count = format == 57 ? 3 : format - 35;
++        r.x = asfloat(w0);
++        if (count > 1) r.y = asfloat(vfetchSwap(vk::RawBufferLoad<uint>(address + 4), endian));
++        if (count > 2) r.z = asfloat(vfetchSwap(vk::RawBufferLoad<uint>(address + 8), endian));
++        if (count > 3) r.w = asfloat(vfetchSwap(vk::RawBufferLoad<uint>(address + 12), endian));
++        return r;  // exp_adjust does not apply to float formats
++    }
++    }
++    return r;
++}
++
++#endif
++
+ float4 cube(float4 value, inout CubeMapData cubeMapData)
+ {
+     uint index = cubeMapData.cubeMapIndex;
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..165449e 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -17,12 +17,12 @@ static constexpr const char* USAGE_TYPES[] =
+ {
+     "float4", // POSITION
+     "float4", // BLENDWEIGHT
+-    "uint4", // BLENDINDICES
+-    "uint4", // NORMAL
++    "float4", // BLENDINDICES
++    "float4", // NORMAL
+     "float4", // PSIZE
+     "float4", // TEXCOORD
+-    "uint4", // TANGENT
+-    "uint4", // BINORMAL
++    "float4", // TANGENT
++    "float4", // BINORMAL
+     "float4", // TESSFACTOR
+     "float4", // POSITIONT
+     "float4", // COLOR
+@@ -74,7 +74,8 @@ struct DeclUsageLocation
+     uint32_t location;
+ };
+ 
+-// NOTE: These are specialized Vulkan locations for Unleashed Recompiled. Change as necessary. Likely not going to work with other games.
++// GTA V: one unique Vulkan location per (usage, index). The native renderer's input layouts use
++// the same table (gtav/src/native/vertex_layout.h), so keep the two in sync.
+ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+ {
+     { DeclUsage::Position, 0, 0 },
+@@ -85,15 +86,30 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+     { DeclUsage::TexCoord, 1, 5 },
+     { DeclUsage::TexCoord, 2, 6 },
+     { DeclUsage::TexCoord, 3, 7 },
+-    { DeclUsage::Color, 0, 8 },
+-    { DeclUsage::BlendIndices, 0, 9 },
+-    { DeclUsage::BlendWeight, 0, 10 },
+-    { DeclUsage::Color, 1, 11 },
+-    { DeclUsage::TexCoord, 4, 12 },
+-    { DeclUsage::TexCoord, 5, 13 },
+-    { DeclUsage::TexCoord, 6, 14 },
+-    { DeclUsage::TexCoord, 7, 15 },
+-    { DeclUsage::Position, 1, 15 },
++    { DeclUsage::TexCoord, 4, 8 },
++    { DeclUsage::TexCoord, 5, 9 },
++    { DeclUsage::TexCoord, 6, 10 },
++    { DeclUsage::TexCoord, 7, 11 },
++    { DeclUsage::Color, 0, 12 },
++    { DeclUsage::Color, 1, 13 },
++    { DeclUsage::BlendIndices, 0, 14 },
++    { DeclUsage::BlendWeight, 0, 15 },
++    { DeclUsage::Position, 1, 16 },
++    { DeclUsage::Position, 2, 17 },
++    { DeclUsage::Position, 3, 18 },
++    { DeclUsage::TexCoord, 8, 19 },
++    { DeclUsage::TexCoord, 9, 20 },
++    { DeclUsage::TexCoord, 10, 21 },
++    { DeclUsage::TexCoord, 11, 22 },
++    { DeclUsage::TexCoord, 12, 23 },
++    { DeclUsage::TexCoord, 13, 24 },
++    { DeclUsage::TexCoord, 14, 25 },
++    { DeclUsage::TexCoord, 15, 26 },
++    { DeclUsage::Normal, 1, 27 },
++    { DeclUsage::Tangent, 1, 28 },
++    { DeclUsage::BlendIndices, 1, 29 },
++    { DeclUsage::BlendWeight, 1, 30 },
++    { DeclUsage::PointSize, 0, 31 },
+ };
+ 
+ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+@@ -118,6 +134,9 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::Color, 1 }
+ };
+ 
++// Xenos has 32 fetch constants; each slot gets a descriptor index per dimension plus a sampler.
++static constexpr uint32_t FETCH_SLOT_COUNT = 32;
++
+ static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+ {
+     "2D",
+@@ -170,6 +189,53 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+         ++indentation;
+     }
+ 
++    if (!instr.isMiniFetch)
++        lastFullVertexFetch = instr;
++    const VertexFetchInstruction& full = instr.isMiniFetch ? lastFullVertexFetch : instr;
++
++    // GTA V: a fetch indexed by anything but the vertex index (r0.x) reads the guest vertex
++    // buffer at the computed element (vfetchIndirect, shader_common.h). The microcode leaves the
++    // format and stride to D3D's bind-time patching, so the host supplies them per input
++    // location from the bound vertex declaration.
++    bool indirect = full.srcRegister != 0 || full.srcSwizzle != 0 || vertexIndexOverwritten;
++    if (instr.dstRegister == 0 && getDestSwizzle(instr.dstSwizzle, 0) != FetchDestinationSwizzle::Keep)
++        vertexIndexOverwritten = true;
++    if (indirect)
++    {
++        auto element = vertexElements.find(address);
++        uint32_t location = ~0u;
++        if (element != vertexElements.end())
++        {
++            for (auto& usageLocation : USAGE_LOCATIONS)
++            {
++                if (usageLocation.usage == element->second.usage && usageLocation.usageIndex == element->second.usageIndex)
++                    location = usageLocation.location;
++            }
++        }
++        indent();
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
++        if (location == ~0u)
++        {
++            out += " = float4(0.0, 0.0, 0.0, 1.0).";
++        }
++        else
++        {
++            print(" = vfetchIndirect({}, r{}.{}, {}).", location, full.srcRegister, SWIZZLES[full.srcSwizzle],
++                  full.isIndexRounded ? "true" : "false");
++        }
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
+     indent();
+     print("r{}.", instr.dstRegister);
+     printDstSwizzle(instr.dstSwizzle, false);
+@@ -179,15 +245,10 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     auto findResult = vertexElements.find(address);
+     assert(findResult != vertexElements.end());
+ 
++    // GTA V: normals arrive as float inputs (the native renderer widens packed 10:10:10:2
++    // data on upload), so there is no R11G11B10 unpack here.
+     switch (findResult->second.usage)
+     {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+-        print("tfetchR11G11B10(");
+-        break;
+-
+     case DeclUsage::TexCoord:
+         print("tfetchTexcoord(g_SwappedTexcoords, ");
+         break;
+@@ -197,12 +258,6 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+ 
+     switch (findResult->second.usage)
+     {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        out += ')';
+-        break;
+-
+     case DeclUsage::TexCoord:
+         print(", {})", uint32_t(findResult->second.usageIndex));
+         break;
+@@ -225,6 +280,51 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+ 
+ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
+ {
++    if (instr.opcode == FetchOpcode::SetTextureLod)
++    {
++        // GTA V: the LOD comes from the first selected source component.
++        indent();
++        println("texLod = r{}.{};", instr.srcRegister, "xyzw"[instr.srcSwizzle & 3]);
++        return;
++    }
++
++    if (instr.opcode == FetchOpcode::GetTextureGradients)
++    {
++        // GTA V (shadow slope bias): (ddx(src.x), ddy(src.x), ddx(src.y), ddy(src.y)), coarse
++        // derivatives as Xenia computes them; no texture is involved.
++        if (instr.isPredicated)
++        {
++            indent();
++            println("if ({}p0)", instr.predCondition ? "" : "!");
++            indent();
++            out += "{\n";
++            ++indentation;
++        }
++        indent();
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
++        if (isPixelShader)
++        {
++            std::string x = fmt::format("r{}.{}", instr.srcRegister, SWIZZLES[instr.srcSwizzle & 0x3]);
++            std::string y = fmt::format("r{}.{}", instr.srcRegister, SWIZZLES[(instr.srcSwizzle >> 2) & 0x3]);
++            print(" = float4(ddx_coarse({0}), ddy_coarse({0}), ddx_coarse({1}), ddy_coarse({1})).", x, y);
++        }
++        else
++        {
++            out += " = float4(0.0, 0.0, 0.0, 0.0).";
++        }
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
+     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
+         return;
+ 
+@@ -252,17 +352,18 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     bool subtractFromOne = false;
+ #endif
+ 
++#ifdef UNLEASHED_RECOMP
+     auto findResult = samplers.find(instr.constIndex);
+     if (findResult != samplers.end())
+     {
+         constNamePtr = findResult->second;
+-
+-    #ifdef UNLEASHED_RECOMP
+         subtractFromOne = hasMtxPrevInvViewProjection && strcmp(constNamePtr, "sampZBuffer") == 0;
+-    #endif
+     }
+     else
++#endif
+     {
++        // Textures are bound by fetch-constant slot, not by reflection name: GTA V's shader
++        // containers omit some samplers (vertex texture fetch) from the constant table.
+         constName = fmt::format("s{}", instr.constIndex);
+         constNamePtr = constName.c_str();
+     }
+@@ -277,6 +378,17 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     }
+ #endif
+ 
++    // GTA V: the instruction's sampling overrides, for auditing what the HLSL does not apply yet
++    // (filters: 0 point, 1 linear, 2 basemap/aniso values, 3 = use the fetch constant).
++    if (instr.opcode == FetchOpcode::TextureFetch)
++    {
++        indent();
++        println("// tfetch {} mag{} min{} mip{} aniso{} comp{} reg{} bias{}{}", constNamePtr, uint32_t(instr.magFilter),
++                uint32_t(instr.minFilter), uint32_t(instr.mipFilter), uint32_t(instr.anisoFilter),
++                uint32_t(instr.useCompLod), uint32_t(instr.useRegLod), instr.lodBias / 16.0f,
++                instr.texCoordDenorm ? " denorm" : "");
++    }
++
+     indent();
+     print("r{}.", instr.dstRegister);
+     printDstSwizzle(instr.dstSwizzle, false);
+@@ -291,7 +403,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+             out += "1.0 - ";
+     #endif
+ 
+-        out += "tfetch";
++        out += "(tfetch";  // closed with the fetch constant's exponent scale below
+         break;
+     }
+     case FetchOpcode::GetTextureWeights:
+@@ -326,13 +438,29 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+ 
+     out += dimension;
+ 
++    // GTA V: explicit LOD (register LOD, or the base level when computed LOD is off).
++    bool explicitLod = instr.opcode == FetchOpcode::TextureFetch && (instr.useRegLod || !instr.useCompLod);
++    if (explicitLod)
++        out += "Lod";
++
++    // GTA V: instruction-level point filter (0 = point; 3 = the fetch constant's filter).
++    if (instr.opcode == FetchOpcode::TextureFetch && instr.dimension == TextureDimension::Texture2D &&
++        instr.magFilter == 0 && instr.minFilter == 0)
++        out += "Point";
++
+ #ifdef UNLEASHED_RECOMP
+-    if (bicubic)
++    if (bicubic && !explicitLod)
+         out += "Bicubic";
+ #endif
+ 
+     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
++    // GTA V: unnormalized (texel-space) coordinates are divided by the texture's size.
++    bool denorm = instr.texCoordDenorm && instr.dimension != TextureDimension::TextureCube;
++    if (denorm)
++        print("denorm{0}({1}_Texture{0}DescriptorIndex, ", dimension, constNamePtr);
+     printSrcRegister(componentCount);
++    if (denorm)
++        out += ")";
+ 
+     switch (instr.dimension)
+     {
+@@ -344,7 +472,14 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         break;
+     }
+ 
+-    out += ").";
++    if (explicitLod)
++        print(", {}{:+}", instr.useRegLod ? "texLod" : "0.0", instr.lodBias / 16.0f);
++
++    // GTA V: the fetch constant's exp_adjust scales every fetched value by 2^exp_adjust.
++    if (instr.opcode == FetchOpcode::TextureFetch)
++        print(") * {}_ExpScale).", constNamePtr);
++    else
++        out += ").";
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+ 
+@@ -669,6 +804,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+     if (vectorWriteMask != 0)
+     {
++        if (exportRegister.empty() && (instr.vectorDest == 0 || instr.vectorDestRelative) && (vectorWriteMask & 1))
++            vertexIndexOverwritten = true;
+         indent();
+         if (!exportRegister.empty())
+         {
+@@ -1036,6 +1173,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+     if (scalarWriteMask != 0)
+     {
++        if (exportRegister.empty() && (instr.scalarDest == 0 || instr.scalarDestRelative) && (scalarWriteMask & 1))
++            vertexIndexOverwritten = true;
+         indent();
+         if (!exportRegister.empty())
+         {
+@@ -1109,6 +1248,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += '\n';
+ 
+     isPixelShader = (shaderContainer->flags & 0x1) == 0;
++    vertexIndexOverwritten = false;
+ 
+     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+@@ -1171,15 +1311,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         case RegisterSet::Sampler:
+         {
+-            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+-            {
+-                println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
+-            }
+-
+-            println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
+-
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+         }
+@@ -1187,6 +1318,20 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+     }
+ 
++    for (uint32_t slot = 0; slot < FETCH_SLOT_COUNT; slot++)
++    {
++        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
++        {
++            println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++                slot, TEXTURE_DIMENSIONS[j], (j * FETCH_SLOT_COUNT + slot) * 4);
++        }
++        println("#define s{}_Texture1DDescriptorIndex s{}_Texture2DDescriptorIndex", slot, slot);
++        println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++            slot, (std::size(TEXTURE_DIMENSIONS) * FETCH_SLOT_COUNT + slot) * 4);
++        println("#define s{}_ExpScale vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {})",
++            slot, 640 + slot * 4);
++    }
++
+     out += "\n#else\n\n";
+ 
+     println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
+@@ -1221,24 +1366,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += "cbuffer SharedConstants : register(b2, space4)\n";
+     out += "{\n";
+ 
+-    for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
++    for (uint32_t slot = 0; slot < FETCH_SLOT_COUNT; slot++)
+     {
+-        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+-            constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
+-
+-        if (constantInfo->registerSet == RegisterSet::Sampler)
++        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+         {
+-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
+-
+-            for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+-            {
+-                println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+-            }
+-
+-            println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++            uint32_t index = uint32_t(j) * FETCH_SLOT_COUNT + slot;
++            println("\tuint s{}_Texture{}DescriptorIndex : packoffset(c{}.{});",
++                slot, TEXTURE_DIMENSIONS[j], index / 4, SWIZZLES[index % 4]);
+         }
++        uint32_t index = uint32_t(std::size(TEXTURE_DIMENSIONS)) * FETCH_SLOT_COUNT + slot;
++        println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});", slot, index / 4, SWIZZLES[index % 4]);
++        println("\tfloat s{}_ExpScale : packoffset(c{}.{});", slot, 40 + slot / 4, SWIZZLES[slot % 4]);
++        println("\t#define s{}_Texture1DDescriptorIndex s{}_Texture2DDescriptorIndex", slot, slot);
+     }
+ 
+     out += "\tDEFINE_SHARED_CONSTANTS();\n";
+@@ -1288,6 +1427,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "#endif\n";
+ 
+         auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
++        pixelOutputs = pixelShader->outputs;
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
+             out += ",\n\tout float4 oC0 : SV_Target0";
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR1)
+@@ -1302,6 +1442,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     else
+     {
+         auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
++        std::set<std::pair<uint32_t, uint32_t>> declaredInputs;
+         for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
+         {
+             union
+@@ -1314,6 +1455,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
+ 
++            // GTA V fetches some semantics more than once (several vfetch instructions per
++            // element); declare each input once, every fetch reads the same variable.
++            vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
++            if (!declaredInputs.emplace(uint32_t(vertexElement.usage), uint32_t(vertexElement.usageIndex)).second)
++                continue;
++
+         #ifdef UNLEASHED_RECOMP
+             if ((vertexElement.usage == DeclUsage::TexCoord && vertexElement.usageIndex == 2 && isMetaInstancer) ||
+                 (vertexElement.usage == DeclUsage::Position && vertexElement.usageIndex == 1))
+@@ -1335,8 +1482,6 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
+                 uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
+-
+-            vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
+         }
+ 
+     #ifdef UNLEASHED_RECOMP
+@@ -1345,6 +1490,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             out += "\tin uint iVertexId : SV_VertexID,\n";
+             out += "\tin uint iInstanceId : SV_InstanceID,\n";
+         }
++    #else
++        // GTA V: Xenos starts every vertex shader with the vertex index (index + base) in r0.x;
++        // particles build their quad corners from it.
++        out += "\tin uint iVertexId : SV_VertexID,\n";
+     #endif
+ 
+         out += "\tout float4 oPos : SV_Position";
+@@ -1464,13 +1613,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             print("\tfloat4 r{} = ", i);
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+             {
+-                out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++                out += "float4((iPos.xy * g_PixelScaleInv - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
+             }
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
+             {
+                 out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
+             }
++        #else
++            else if (!isPixelShader && i == 0)
++            {
++                out += "float4(float(iVertexId), 0.0, 0.0, 0.0);\n";
++            }
+         #endif
+             else
+             {
+@@ -1482,6 +1636,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += "\tint a0 = 0;\n";
+     out += "\tint aL = 0;\n";
+     out += "\tbool p0 = false;\n";
++    out += "\tfloat texLod = 0.0;\n";  // GTA V: set by setTexLOD, used by fetches with UseRegisterLOD
+     out += "\tfloat ps = 0.0;\n";
+     if (isPixelShader)
+     {
+@@ -1612,6 +1767,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             uint32_t sequence = 0;
+             bool shouldReturn = false;
+             bool shouldCloseCurlyBracket = false;
++            bool closeCondExec = false;
+ 
+             switch (cfInstr.opcode)
+             {
+@@ -1623,15 +1779,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 shouldReturn = (cfInstr.opcode == ControlFlowOpcode::ExecEnd);
+                 break;
+ 
++            // GTA V: conditional execs run their instructions only when the bool constant (or p0)
++            // equals the instruction's condition; the shader end of an ...End variant applies either
++            // way. Emitting them unconditionally ran GTA's wind-leaf player-collision block
++            // (cexec b0) with an unset _globalEntityScale, collapsing tree leaves to a point.
+             case ControlFlowOpcode::CondExec:
+             case ControlFlowOpcode::CondExecEnd:
+             case ControlFlowOpcode::CondExecPredClean:
+             case ControlFlowOpcode::CondExecPredCleanEnd:
++            {
+                 address = cfInstr.condExec.address;
+                 count = cfInstr.condExec.count;
+                 sequence = cfInstr.condExec.sequence;
+-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
++                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
++
++                indent();
++                auto findResult = boolConstants.find(cfInstr.condExec.boolAddress);
++                if (findResult != boolConstants.end())
++                    println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condExec.condition ? "!" : "=");
++                else if (cfInstr.condExec.boolAddress < 16)  // g_Booleans: VS bools 0-15, PS bools 0-15 << 16
++                    println("if ((g_Booleans & (1u << {})) {}= 0)", uint32_t(cfInstr.condExec.boolAddress) + (isPixelShader ? 16 : 0),
++                            cfInstr.condExec.condition ? "!" : "=");
++                else
++                    println("if ({})", cfInstr.condExec.condition ? "false" : "true");  // not in g_Booleans: reads as 0
++                indent();
++                out += "{\n";
++                ++indentation;
++                closeCondExec = true;
+                 break;
++            }
+ 
+             case ControlFlowOpcode::CondExecPred:
+             case ControlFlowOpcode::CondExecPredEnd:
+@@ -1639,6 +1815,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 count = cfInstr.condExecPred.count;
+                 sequence = cfInstr.condExecPred.sequence;
+                 shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecPredEnd);
++
++                indent();
++                println("if ({}p0)", cfInstr.condExecPred.condition ? "" : "!");
++                indent();
++                out += "{\n";
++                ++indentation;
++                closeCondExec = true;
+                 break;
+ 
+             case ControlFlowOpcode::LoopStart:
+@@ -1792,6 +1975,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 instructionCode += 3;
+             }
+ 
++            if (closeCondExec)
++            {
++                --indentation;
++                indent();
++                out += "}\n";
++            }
++
+             if (shouldReturn)
+             {
+                 if (isPixelShader)
+@@ -1804,11 +1994,47 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     out += '{';
+ 
+                     indent();
+-                    out += "\tclip(oC0.w - g_AlphaThreshold);\n";
++                    // GTA V: RB_COLORCONTROL.alpha_func (g_AlphaFunc: 0 never, 1 less, 2 equal, 3 lequal,
++                    // 4 greater, 5 notequal, 6 gequal, 7 always); faded-out LODs use "never".
++                    out += "\tuint alphaFunc = g_AlphaFunc;\n";
++                    indent();
++                    out += "\tbool alphaPass = (alphaFunc & 1) && oC0.w < g_AlphaThreshold || (alphaFunc & 2) && oC0.w == g_AlphaThreshold || (alphaFunc & 4) && oC0.w > g_AlphaThreshold;\n";
++                    indent();
++                    out += "\tclip(alphaPass ? 1.0 : -1.0);\n";
+ 
+                     indent();
+                     out += "}";
+ 
++                    // GTA V: RB_COLORCONTROL alpha-to-mask without MSAA (g_AlphaToMask = offsets
++                    // | 0x100): the Xenos 2x2 dither, a pixel survives when alpha >= 1 - offset/4
++                    // with its quad position's 2-bit offset, index = y low bit | x high bit (Xenia's 1-sample path).
++                    if (pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR0)
++                    {
++                        indent();
++                        out += "[branch] if (g_AlphaToMask != 0)";
++                        indent();
++                        out += '{';
++                        indent();
++                        out += "\tuint2 a2mPos = uint2(iPos.xy) & 1;\n";
++                        indent();
++                        out += "\tuint a2mOffset = (g_AlphaToMask >> ((a2mPos.y | (a2mPos.x << 1)) * 2)) & 3;\n";
++                        indent();
++                        out += "\tclip(oC0.w - (1.0 - float(a2mOffset) * 0.25));\n";
++                        indent();
++                        out += '}';
++                    }
++
++                    // GTA V: per-target output scale (render-target exponent bias and the 1/32
++                    // of the Xenos fixed-point 16-bit formats, stored as SNORM on the host).
++                    for (uint32_t i = 0; i < 4; i++)
++                    {
++                        if (pixelOutputs & (PIXEL_SHADER_OUTPUT_COLOR0 << i))
++                        {
++                            indent();
++                            println("oC{0} *= g_ColorScale({0});", i);
++                        }
++                    }
++
+                 #ifdef UNLEASHED_RECOMP
+                     specConstantsMask |= SPEC_CONSTANT_ALPHA_TO_COVERAGE;
+ 
+@@ -1832,7 +2058,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     if (!hasMtxProjection)
+                 #endif
+                     {
+-                        out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
++                        // GTA V: g_NdcScale/g_NdcOffset map screen-space positions (draws with
++                        // the viewport transform disabled) to clip space; identity otherwise.
++                        out += "\toPos.xy = oPos.xy * g_NdcScale + (g_HalfPixelOffset + g_NdcOffset) * oPos.w;\n";
+                     }
+                 }
+ 
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index b2e317d..6d8c4b9 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -27,12 +27,18 @@ struct ShaderRecompiler : StringBuffer
+     bool isPixelShader = false;
+     const uint8_t* constantTableData = nullptr;
+     std::unordered_map<uint32_t, VertexElement> vertexElements;
++    // GTA V: the last full vertex fetch (mini fetches reuse its index, slot and stride).
++    VertexFetchInstruction lastFullVertexFetch{};
++    // GTA V: r0.x starts as the vertex index; once the shader writes it, a fetch from r0.x reads
++    // a computed element (vfetchIndirect) rather than this vertex's input.
++    bool vertexIndexOverwritten = false;
+     std::unordered_map<uint32_t, std::string> interpolators;
+     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
+     std::unordered_map<uint32_t, const char*> boolConstants;
+     std::unordered_map<uint32_t, const char*> samplers;
+     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
+     uint32_t specConstantsMask = 0;
++    uint32_t pixelOutputs = 0;  // PIXEL_SHADER_OUTPUT_* of the shader being recompiled
+ 
+ #ifdef UNLEASHED_RECOMP
+     bool hasMtxProjection = false;
