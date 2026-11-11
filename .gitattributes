@@ -1,0 +1,20 @@
+# Text is stored with LF (Linux and macOS check out as-is); Windows batch files need CRLF.
+* text=auto eol=lf
+*.py text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.inc text eol=lf
+*.hlsl text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.manifest text eol=lf
+*.patch text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+LICENSE text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
